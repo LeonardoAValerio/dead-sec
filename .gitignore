@@ -1,0 +1,42 @@
+# Flutter / Dart
+mobile/.dart_tool/
+mobile/.flutter-plugins
+mobile/.flutter-plugins-dependencies
+mobile/.packages
+mobile/build/
+mobile/android/.gradle/
+mobile/android/local.properties
+mobile/android/key.properties
+mobile/ios/Pods/
+mobile/ios/.symlinks/
+mobile/ios/Flutter/Flutter.framework
+mobile/ios/Flutter/Flutter.podspec
+mobile/ios/Runner.xcworkspace/xcshareddata/
+mobile/.metadata
+mobile/pubspec.lock
+mobile/coverage/
+
+# Go
+server/bin/
+server/*.exe
+server/*.test
+server/vendor/
+server/go.sum
+
+# Secrets & certs
+*.pem
+*.key
+*.crt
+*.p12
+.env
+.env.*
+server/certs/
+
+# IDE
+.idea/
+*.iml
+.vscode/settings.json
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
