@@ -44,6 +44,11 @@ func main() {
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
+		shortKey := pubKey
+		if len(shortKey) > 8 {
+			shortKey = shortKey[:8] + "…"
+		}
+		log.Printf("[AUTH] token issued pk=%s", shortKey)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"token": token})
 	})

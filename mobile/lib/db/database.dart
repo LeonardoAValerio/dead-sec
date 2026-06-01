@@ -6,6 +6,9 @@ import 'package:sqflite_common/sqlite_api.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart' as ffi;
 import 'package:sqflite_sqlcipher/sqflite.dart' as cipher;
 
+// Isola o arquivo de banco por instância em desenvolvimento multi-peer.
+const _instanceId = String.fromEnvironment('INSTANCE_ID', defaultValue: '');
+
 /// Abre o banco de dados local.
 ///
 /// Android/iOS: SQLCipher com chave derivada do PIN (SPEC-CRYPTO-003).
@@ -40,10 +43,50 @@ Future<Database> _openMobileDatabase(String encryptionKey) async {
 Future<Database> _openDesktopDatabase() async {
   ffi.sqfliteFfiInit();
   ffi.databaseFactory = ffi.databaseFactoryFfi;
+  final dbPath = _desktopDbPath();
+  await Directory(p.dirname(dbPath)).create(recursive: true);
+  return ffi.databaseFactory.openDatabase(
+    dbPath,
+    options: OpenDatabaseOptions(
+      version: 1,
+      onCreate: _createSchema,
+      onConfigure: (db) async {
+        await db.execute('PRAGMA journal_mode=WAL');
+        await db.execute('PRAGMA foreign_keys=ON');
+      },
+    ),
+  );
+}
+
+String _desktopDbPath() {
+  final suffix = _instanceId.isNotEmpty ? '_$_instanceId' : '';
+  if (Platform.isLinux || Platform.isMacOS) {
+    final home = Platform.environment['HOME'] ?? '.';
+    return p.join(home, '.local', 'share', 'safechannel$suffix', 'safechannel.db');
+  }
+  // Windows
+  final appData = Platform.environment['APPDATA'] ?? '.';
+  return p.join(appData, 'SafeChannel$suffix', 'safechannel.db');
+}
+
+/// Abre um banco em memória para testes automatizados.
+/// Usa o mesmo schema de produção — não persiste dados entre testes.
+Future<Database> openTestDatabase() async {
+  ffi.sqfliteFfiInit();
+  ffi.databaseFactory = ffi.databaseFactoryFfi;
   return ffi.databaseFactory.openDatabase(
     inMemoryDatabasePath,
     options: OpenDatabaseOptions(version: 1, onCreate: _createSchema),
   );
+}
+
+/// Deleta o banco de dados local no desktop (Linux/macOS/Windows).
+/// Chamado ao resetar a instância com --dart-define=RESET_ON_START=true.
+Future<void> resetDesktopDatabase() async {
+  if (!_isDesktopOrWeb) return;
+  final dbPath = _desktopDbPath();
+  final file = File(dbPath);
+  if (await file.exists()) await file.delete();
 }
 
 Future<void> _createSchema(Database db, int version) async {
@@ -81,6 +124,9 @@ Future<void> _createSchema(Database db, int version) async {
       role TEXT NOT NULL DEFAULT 'member',
       joined_at INTEGER NOT NULL,
       vector_clock TEXT NOT NULL DEFAULT '{}',
+      signal_key         BLOB,
+      signal_pre_key     BLOB,
+      signal_pre_key_sig BLOB,
       PRIMARY KEY (channel_id, user_id),
       FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE
     )

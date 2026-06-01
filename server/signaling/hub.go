@@ -44,7 +44,8 @@ func (r *Room) isEmpty() bool {
 }
 
 // broadcast envia uma mensagem para todos os peers da room exceto o remetente.
-func (r *Room) broadcast(fromPubKey string, msg []byte) {
+// Retorna o número de peers alcançados.
+func (r *Room) broadcast(fromPubKey string, msg []byte) int {
 	r.mu.RLock()
 	targets := make([]*peer, 0, len(r.peers))
 	for pk, p := range r.peers {
@@ -54,10 +55,13 @@ func (r *Room) broadcast(fromPubKey string, msg []byte) {
 	}
 	r.mu.RUnlock()
 
+	sent := 0
 	for _, p := range targets {
-		// Ignora erros de escrita — peer provavelmente desconectou
-		_ = p.conn.Write(context.Background(), websocket.MessageText, msg)
+		if err := p.conn.Write(context.Background(), websocket.MessageText, msg); err == nil {
+			sent++
+		}
 	}
+	return sent
 }
 
 // Hub gerencia todas as rooms ativas.
@@ -107,11 +111,26 @@ func (h *Hub) Leave(roomID, pubKey string) {
 }
 
 // Broadcast repassa uma mensagem para os outros peers da room.
-func (h *Hub) Broadcast(roomID, fromPubKey string, msg []byte) {
+// Retorna o número de peers que receberam a mensagem.
+func (h *Hub) Broadcast(roomID, fromPubKey string, msg []byte) int {
 	h.mu.RLock()
 	r, ok := h.rooms[roomID]
 	h.mu.RUnlock()
 	if ok {
-		r.broadcast(fromPubKey, msg)
+		return r.broadcast(fromPubKey, msg)
 	}
+	return 0
+}
+
+// roomSize retorna o número de peers atualmente na room.
+func (h *Hub) roomSize(roomID string) int {
+	h.mu.RLock()
+	r, ok := h.rooms[roomID]
+	h.mu.RUnlock()
+	if !ok {
+		return 0
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.peers)
 }

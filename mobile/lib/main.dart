@@ -11,7 +11,10 @@ const _kResetOnStart = bool.fromEnvironment('RESET_ON_START');
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  if (_kResetOnStart) await KeyManager.deleteAllKeys();
+  if (_kResetOnStart) {
+    await KeyManager.deleteAllKeys();
+    await resetDesktopDatabase();
+  }
   runApp(const SafeChannelApp());
 }
 
@@ -60,6 +63,9 @@ class _LoaderState extends State<_Loader> {
         MaterialPageRoute(builder: (_) => const OnboardingScreen()),
       );
     } else {
+      // Migração: gera signal_identity_v1 se o keystore foi criado antes dessa chave existir.
+      await KeyManager.ensureSignalIdentityKey();
+      if (!mounted) return;
       Navigator.of(context).pushReplacement(
         MaterialPageRoute(builder: (_) => const _PinUnlockScreen()),
       );

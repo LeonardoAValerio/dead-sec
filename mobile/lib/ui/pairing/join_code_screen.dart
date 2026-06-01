@@ -137,8 +137,9 @@ class _JoinCodeScreenState extends State<JoinCodeScreen> {
         return;
       }
 
+      // A navegação (fechar esta tela + abrir ChatScreen) é responsabilidade
+      // do callback onJoined em contacts_screen.dart via Navigator cascade.
       widget.onJoined(result);
-      if (mounted) Navigator.of(context).pop();
     } catch (e, stack) {
       debugPrint('joinViaCode error: $e\n$stack');
       setState(() => _error = 'Erro: $e');

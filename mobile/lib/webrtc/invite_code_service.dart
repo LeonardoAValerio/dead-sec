@@ -24,6 +24,8 @@ class InviteCodeService {
       'name': qr.channelName,
       'pk': base64Encode(qr.creatorPublicKey),
       'spk': base64Encode(qr.signedPreKey),
+      if (qr.signalIdentityKey != null) 'sik': base64Encode(qr.signalIdentityKey!),
+      if (qr.preKeySignature != null) 'spksig': base64Encode(qr.preKeySignature!),
     };
 
     if (password == null || password.isEmpty) {
@@ -73,6 +75,12 @@ class InviteCodeService {
         creatorPublicKey: base64Decode(inner['pk'] as String),
         signedPreKey: base64Decode(inner['spk'] as String),
         expiresAt: 0, // códigos de convite não expiram
+        signalIdentityKey: inner['sik'] != null
+            ? base64Decode(inner['sik'] as String)
+            : null,
+        preKeySignature: inner['spksig'] != null
+            ? base64Decode(inner['spksig'] as String)
+            : null,
       );
     } catch (_) {
       return null;
@@ -84,8 +92,10 @@ class InviteCodeService {
       ..init(true, pc.AEADParameters(pc.KeyParameter(key), 128, iv, Uint8List(0)));
     final output = Uint8List(cipher.getOutputSize(plaintext.length));
     final len = cipher.processBytes(plaintext, 0, plaintext.length, output, 0);
-    cipher.doFinal(output, len);
-    return output;
+    // doFinal retorna quantos bytes adicionais foram escritos (bloco final + tag GCM).
+    // Retornar sublist para não incluir bytes zerados além do que foi realmente escrito.
+    final remaining = cipher.doFinal(output, len);
+    return output.sublist(0, len + remaining);
   }
 
   static Uint8List _decryptGcm(Uint8List key, Uint8List iv, Uint8List ciphertext) {
@@ -93,8 +103,8 @@ class InviteCodeService {
       ..init(false, pc.AEADParameters(pc.KeyParameter(key), 128, iv, Uint8List(0)));
     final output = Uint8List(cipher.getOutputSize(ciphertext.length));
     final len = cipher.processBytes(ciphertext, 0, ciphertext.length, output, 0);
-    cipher.doFinal(output, len);
-    return output;
+    final remaining = cipher.doFinal(output, len);
+    return output.sublist(0, len + remaining);
   }
 
   static Uint8List _deriveKey(String password, Uint8List salt) {

@@ -34,19 +34,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	tokenStr := r.URL.Query().Get("token")
 	pubKey, err := auth.ValidateToken(tokenStr, h.jwtSecret)
 	if err != nil {
+		log.Printf("[WS] rejected connection — invalid JWT: %v", err)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
+	shortKey := shortPK(pubKey)
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		InsecureSkipVerify: false,
 	})
 	if err != nil {
-		log.Printf("ws accept error: %v", err)
+		log.Printf("[WS] accept error (pk=%s): %v", shortKey, err)
 		return
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
+	log.Printf("[WS] connected  pk=%s", shortKey)
 	p := &peer{pubKey: pubKey, conn: conn}
 	ctx := r.Context()
 
@@ -59,6 +62,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		var msg SignalMessage
 		if err := json.Unmarshal(data, &msg); err != nil {
+			log.Printf("[WS] bad JSON from pk=%s: %v", shortKey, err)
 			continue
 		}
 		if msg.Room == "" || msg.Type == "" {
@@ -71,19 +75,40 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		switch msg.Type {
 		case "join":
 			h.hub.Join(msg.Room, p)
+			roomSize := h.hub.roomSize(msg.Room)
+			log.Printf("[HUB] join  pk=%s room=%s peers_in_room=%d", shortKey, shortRoom(msg.Room), roomSize)
 		case "leave":
 			h.hub.Leave(msg.Room, pubKey)
+			log.Printf("[HUB] leave pk=%s room=%s", shortKey, shortRoom(msg.Room))
 		case "offer", "answer", "ice-candidate":
 			out, err := json.Marshal(msg)
 			if err != nil {
 				continue
 			}
-			h.hub.Broadcast(msg.Room, pubKey, out)
+			n := h.hub.Broadcast(msg.Room, pubKey, out)
+			log.Printf("[HUB] %-13s from=%s room=%s delivered_to=%d", msg.Type, shortKey, shortRoom(msg.Room), n)
 		}
 	}
 
+	log.Printf("[WS] disconnected pk=%s", shortKey)
 	// Limpeza ao desconectar — SPEC-ARCH-001: sem rastros em memória
 	h.cleanupAllRooms(ctx, pubKey)
+}
+
+// shortPK retorna os primeiros 8 caracteres da chave pública para logs legíveis.
+func shortPK(pk string) string {
+	if len(pk) > 8 {
+		return pk[:8] + "…"
+	}
+	return pk
+}
+
+// shortRoom retorna os primeiros 8 chars do UUID de room para logs.
+func shortRoom(room string) string {
+	if len(room) > 8 {
+		return room[:8] + "…"
+	}
+	return room
 }
 
 func (h *Handler) cleanupAllRooms(ctx context.Context, pubKey string) {

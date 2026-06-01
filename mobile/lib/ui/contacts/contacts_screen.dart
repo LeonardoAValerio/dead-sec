@@ -199,7 +199,22 @@ class _ContactsScreenState extends State<ContactsScreen> {
         builder: (_) => JoinCodeScreen(
           db: widget.db,
           currentUser: widget.currentUser,
-          onJoined: (_) => _loadChannels(),
+          onJoined: (ch) {
+            _loadChannels();
+            if (mounted) {
+              // Fecha JoinCodeScreen e abre ChatScreen diretamente.
+              // JoinCodeScreen não deve chamar Navigator.pop() — este callback assume a navegação.
+              Navigator.of(context)
+                ..pop()  // fecha JoinCodeScreen
+                ..push(MaterialPageRoute(
+                  builder: (_) => ChatScreen(
+                    db: widget.db,
+                    currentUser: widget.currentUser,
+                    channel: ch,
+                  ),
+                ));
+            }
+          },
         ),
       ),
     );

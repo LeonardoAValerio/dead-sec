@@ -1,6 +1,6 @@
 import 'dart:async';
-import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 import 'signaling_client.dart';
@@ -22,6 +22,11 @@ class PeerConnectionManager {
   RTCPeerConnection? _pc;
   RTCDataChannel? _dataChannel;
 
+  // ICE candidates que chegam antes de setRemoteDescription são bufferizados e
+  // aplicados assim que a remote description estiver pronta.
+  bool _remoteDescriptionSet = false;
+  final List<RTCIceCandidate> _pendingCandidates = [];
+
   final _messageController = StreamController<RTCDataChannelMessage>.broadcast();
   final _indicatorController = StreamController<ConnectionIndicator>.broadcast();
 
@@ -29,6 +34,10 @@ class PeerConnectionManager {
   Stream<ConnectionIndicator> get onIndicator => _indicatorController.stream;
 
   bool get isConnected => _dataChannel?.state == RTCDataChannelState.RTCDataChannelOpen;
+
+  /// Chamado quando o RTCDataChannel está aberto e pronto para enviar/receber.
+  /// Usar para inicializar Signal Protocol, SyncManager e reenviar mensagens pending.
+  void Function(RTCDataChannel)? onDataChannelReady;
 
   PeerConnectionManager({
     required this.signalingClient,
@@ -40,6 +49,7 @@ class PeerConnectionManager {
   // ─── Iniciar chamada (peer que cria a oferta) ──────────────────────────
 
   Future<void> startAsOfferer() async {
+    debugPrint('[PCM] startAsOfferer — creating peer connection');
     await _createPeerConnection();
     _dataChannel = await _pc!.createDataChannel(
       'safechannel',
@@ -52,14 +62,17 @@ class PeerConnectionManager {
 
     final offer = await _pc!.createOffer();
     await _pc!.setLocalDescription(offer);
+    debugPrint('[PCM] offer created and sent');
     signalingClient.send('offer', roomId, localPubKey, offer.toMap());
   }
 
   // ─── Responder chamada ─────────────────────────────────────────────────
 
   Future<void> startAsAnswerer() async {
+    debugPrint('[PCM] startAsAnswerer — waiting for offer');
     await _createPeerConnection();
     _pc!.onDataChannel = (channel) {
+      debugPrint('[PCM] onDataChannel received');
       _dataChannel = channel;
       _setupDataChannel(channel);
     };
@@ -96,15 +109,20 @@ class PeerConnectionManager {
     };
 
     _pc!.onConnectionState = (state) {
+      debugPrint('[PCM] connectionState → $state');
       if (state == RTCPeerConnectionState.RTCPeerConnectionStateDisconnected ||
           state == RTCPeerConnectionState.RTCPeerConnectionStateFailed) {
         _indicatorController.add(ConnectionIndicator.offline);
       }
     };
 
+    _pc!.onSignalingState = (state) {
+      debugPrint('[PCM] signalingState → $state');
+    };
+
     // Detecta tipo de candidato via getStats() quando ICE conecta (SPEC-UI-001).
-    // flutter_webrtc não expõe onSelectedCandidatePairChanged — usa stats para inferir.
     _pc!.onIceConnectionState = (state) async {
+      debugPrint('[PCM] iceConnectionState → $state');
       if (state == RTCIceConnectionState.RTCIceConnectionStateConnected ||
           state == RTCIceConnectionState.RTCIceConnectionStateCompleted) {
         await _updateIndicatorFromStats();
@@ -113,12 +131,19 @@ class PeerConnectionManager {
         _indicatorController.add(ConnectionIndicator.offline);
       }
     };
+
+    _pc!.onIceGatheringState = (state) {
+      debugPrint('[PCM] iceGatheringState → $state');
+    };
   }
 
   void _setupDataChannel(RTCDataChannel channel) {
     channel.onMessage = (msg) => _messageController.add(msg);
     channel.onDataChannelState = (state) {
-      if (state == RTCDataChannelState.RTCDataChannelClosed) {
+      debugPrint('[PCM] dataChannelState → $state');
+      if (state == RTCDataChannelState.RTCDataChannelOpen) {
+        onDataChannelReady?.call(channel);
+      } else if (state == RTCDataChannelState.RTCDataChannelClosed) {
         _indicatorController.add(ConnectionIndicator.offline);
       }
     };
@@ -128,29 +153,69 @@ class PeerConnectionManager {
     signalingClient.messages.listen((msg) async {
       switch (msg.type) {
         case SignalingMessageType.offer:
-          await _pc!.setRemoteDescription(
-            RTCSessionDescription(msg.data['sdp'] as String, msg.data['type'] as String),
-          );
-          final answer = await _pc!.createAnswer();
-          await _pc!.setLocalDescription(answer);
-          signalingClient.send('answer', roomId, localPubKey, answer.toMap());
+          debugPrint('[PCM] received offer — setting remote description');
+          try {
+            await _pc!.setRemoteDescription(
+              RTCSessionDescription(msg.data['sdp'] as String, msg.data['type'] as String),
+            );
+            _remoteDescriptionSet = true;
+            await _flushPendingCandidates();
+            final answer = await _pc!.createAnswer();
+            await _pc!.setLocalDescription(answer);
+            debugPrint('[PCM] answer created and sent');
+            signalingClient.send('answer', roomId, localPubKey, answer.toMap());
+          } catch (e) {
+            debugPrint('[PCM] error handling offer: $e');
+          }
 
         case SignalingMessageType.answer:
-          await _pc!.setRemoteDescription(
-            RTCSessionDescription(msg.data['sdp'] as String, msg.data['type'] as String),
-          );
+          debugPrint('[PCM] received answer — setting remote description');
+          try {
+            await _pc!.setRemoteDescription(
+              RTCSessionDescription(msg.data['sdp'] as String, msg.data['type'] as String),
+            );
+            _remoteDescriptionSet = true;
+            await _flushPendingCandidates();
+            debugPrint('[PCM] remote description set ✓ (flushed ${_pendingCandidates.length} buffered candidates)');
+          } catch (e) {
+            debugPrint('[PCM] error handling answer: $e');
+          }
 
         case SignalingMessageType.iceCandidate:
-          await _pc!.addCandidate(RTCIceCandidate(
+          final candidate = RTCIceCandidate(
             msg.data['candidate'] as String?,
             msg.data['sdpMid'] as String?,
             msg.data['sdpMLineIndex'] as int?,
-          ));
+          );
+          if (_remoteDescriptionSet) {
+            try {
+              await _pc!.addCandidate(candidate);
+            } catch (e) {
+              debugPrint('[PCM] addCandidate error (ignored): $e');
+            }
+          } else {
+            debugPrint('[PCM] ICE candidate buffered (remote desc not ready yet), total=${_pendingCandidates.length + 1}');
+            _pendingCandidates.add(candidate);
+          }
 
         default:
+          debugPrint('[PCM] unknown signaling message type: ${msg.type}');
           break;
       }
     });
+  }
+
+  Future<void> _flushPendingCandidates() async {
+    if (_pendingCandidates.isEmpty) return;
+    debugPrint('[PCM] flushing ${_pendingCandidates.length} buffered ICE candidates');
+    for (final candidate in _pendingCandidates) {
+      try {
+        await _pc!.addCandidate(candidate);
+      } catch (e) {
+        debugPrint('[PCM] buffered candidate failed (ignored): $e');
+      }
+    }
+    _pendingCandidates.clear();
   }
 
   Future<void> _updateIndicatorFromStats() async {

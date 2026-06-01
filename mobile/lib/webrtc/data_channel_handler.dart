@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart' hide MessageType;
 
 import '../crypto/message_signer.dart';
@@ -28,6 +28,18 @@ class DataChannelHandler {
   final _incomingController = StreamController<Message>.broadcast();
   Stream<Message> get onMessage => _incomingController.stream;
 
+  bool _sessionReady = false;
+
+  /// True após o primeiro decrypt bem-sucedido (X3DH completo no lado do admin).
+  bool get sessionReady => _sessionReady;
+
+  /// Chamado quando a sessão Signal está pronta para criptografar (X3DH completo).
+  void Function()? onSessionReady;
+
+  /// Chamado para mensagens de texto (não-binárias) recebidas pelo DataChannel.
+  /// Usar para rotear mensagens de controle do SyncManager (SYNC_REQUEST, SYNC_RESPONSE, SYNC_ACK).
+  void Function(RTCDataChannelMessage)? onControlMessage;
+
   DataChannelHandler({
     required this.dataChannel,
     required this.session,
@@ -40,34 +52,48 @@ class DataChannelHandler {
 
   // ─── Envio ───────────────────────────────────────────────────────────────
 
-  Future<void> send(Message message) async {
-    final plaintext = utf8.encode(jsonEncode({
-      'id': message.id,
-      'channel_id': message.channelId,
-      'sender_id': message.senderId,
-      'type': message.type.name,
-      'payload': base64Encode(message.payload),
-      'timestamp': message.timestamp.millisecondsSinceEpoch,
-      'vector_clock': message.vectorClock,
-    }));
+  /// Retorna `true` se o envio foi bem-sucedido, `false` se a sessão Signal não está
+  /// pronta (X3DH incompleto no lado do admin) ou se houve erro de criptografia.
+  Future<bool> send(Message message) async {
+    try {
+      final plaintext = utf8.encode(jsonEncode({
+        'id': message.id,
+        'channel_id': message.channelId,
+        'sender_id': message.senderId,
+        'type': message.type.name,
+        'payload': base64Encode(message.payload),
+        'timestamp': message.timestamp.millisecondsSinceEpoch,
+        'vector_clock': message.vectorClock,
+      }));
 
-    final payload = Uint8List.fromList(plaintext);
-    final signature = await MessageSigner.sign(payload);
-    final ciphertext = await session.encrypt(payload);
+      final payload = Uint8List.fromList(plaintext);
+      final signature = await MessageSigner.sign(payload);
+      final ciphertext = await session.encrypt(payload);
 
-    // Wire format: [4 bytes sig length][signature][ciphertext]
-    final sigLen = ByteData(4)..setUint32(0, signature.length, Endian.big);
-    final wire = Uint8List(4 + signature.length + ciphertext.length)
-      ..setRange(0, 4, sigLen.buffer.asUint8List())
-      ..setRange(4, 4 + signature.length, signature)
-      ..setRange(4 + signature.length, 4 + signature.length + ciphertext.length, ciphertext);
+      // Wire format: [4 bytes sig length][signature][ciphertext]
+      final sigLen = ByteData(4)..setUint32(0, signature.length, Endian.big);
+      final wire = Uint8List(4 + signature.length + ciphertext.length)
+        ..setRange(0, 4, sigLen.buffer.asUint8List())
+        ..setRange(4, 4 + signature.length, signature)
+        ..setRange(4 + signature.length, 4 + signature.length + ciphertext.length, ciphertext);
 
-    dataChannel.send(RTCDataChannelMessage.fromBinary(wire));
+      dataChannel.send(RTCDataChannelMessage.fromBinary(wire));
+      return true;
+    } catch (e) {
+      debugPrint('[DCH] send failed — session not ready or crypto error: $e');
+      return false;
+    }
   }
 
   // ─── Recebimento ──────────────────────────────────────────────────────────
 
   Future<void> _handleIncoming(RTCDataChannelMessage raw) async {
+    // Mensagens de texto são mensagens de controle (sync protocol) — não payload Signal.
+    if (!raw.isBinary) {
+      onControlMessage?.call(raw);
+      return;
+    }
+    debugPrint('[DCH] _handleIncoming binary (${raw.binary.length} bytes)');
     try {
       final wire = raw.binary;
       if (wire.length < 4) return;
@@ -77,8 +103,10 @@ class DataChannelHandler {
 
       final signature = wire.sublist(4, 4 + sigLen);
       final ciphertext = wire.sublist(4 + sigLen);
+      debugPrint('[DCH] wire ok — sigLen=$sigLen cipherLen=${ciphertext.length}');
 
       final plaintext = await session.decrypt(ciphertext);
+      debugPrint('[DCH] decrypt ok — plaintext ${plaintext.length} bytes');
 
       final json = jsonDecode(utf8.decode(plaintext)) as Map<String, dynamic>;
       final senderId = json['sender_id'] as String;
@@ -87,11 +115,20 @@ class DataChannelHandler {
       // A chave do remetente é resolvida do ChannelMember no DB pelo PairingService após o handshake.
       // A `signature` é preservada na mensagem persistida para verificação posterior.
 
+      final msgType = MessageType.fromString(json['type'] as String? ?? 'text');
+
+      // Marca a sessão como pronta no primeiro decrypt bem-sucedido (X3DH completo).
+      if (!_sessionReady) {
+        _sessionReady = true;
+        debugPrint('[DCH] X3DH complete — session ready');
+        onSessionReady?.call();
+      }
+
       final message = Message(
         id: json['id'] as String,
         channelId: json['channel_id'] as String,
         senderId: senderId,
-        type: MessageType.fromString(json['type'] as String? ?? 'text'),
+        type: msgType,
         payload: base64Decode(json['payload'] as String),
         timestamp: DateTime.fromMillisecondsSinceEpoch(json['timestamp'] as int),
         vectorClock: Map<String, int>.from(json['vector_clock'] as Map? ?? {}),
@@ -102,10 +139,13 @@ class DataChannelHandler {
       // Deduplicação por UUID (SPEC-SYNC-002)
       if (!await messageRepo.exists(message.id)) {
         await messageRepo.save(message);
+        debugPrint('[DCH] message saved → emitting to stream');
         _incomingController.add(message);
+      } else {
+        debugPrint('[DCH] message already exists — skipped (id=${message.id})');
       }
-    } catch (_) {
-      // Descarta silenciosamente mensagens corrompidas ou com assinatura inválida (SPEC-MSG-001)
+    } catch (e) {
+      debugPrint('[DCH] _handleIncoming error (message discarded): $e');
     }
   }
 
