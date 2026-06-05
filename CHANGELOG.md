@@ -5,7 +5,7 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
-## [Unreleased] — Correções de Experiência P2P: Peer Notifications + SESSION_HELLO
+## [0.1.2] — Correções de Experiência P2P: Peer Notifications + SESSION_HELLO
 
 **Foco:** Três problemas de UX na conexão P2P resolvidos: member-antes-do-owner,
 reconexão parcial e X3DH sem trigger automático.
@@ -53,7 +53,7 @@ reconexão parcial e X3DH sem trigger automático.
 
 ---
 
-## [Unreleased] — Signal Protocol E2E + Correções de Protocolo
+## [0.1.1] — Signal Protocol E2E + Correções de Protocolo
 
 **Foco:** Tornar a comunicação criptografada de ponta a ponta funcional em P2P local.
 Comunicação bidirecional via Signal Protocol (X3DH + Double Ratchet) validada com dois peers no mesmo Linux.
