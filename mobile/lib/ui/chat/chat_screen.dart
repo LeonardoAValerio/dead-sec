@@ -28,7 +28,7 @@ import '../shared/connection_indicator.dart';
 import '../shared/message_status_icon.dart';
 
 /// URL do servidor de sinalização — sobrescrita com --dart-define=SERVER_URL=http://host:port
-const _kServerUrl = String.fromEnvironment('SERVER_URL', defaultValue: 'http://localhost:8080');
+const _kServerUrl = String.fromEnvironment('SERVER_URL', defaultValue: 'http://localhost:8000');
 
 class ChatScreen extends StatefulWidget {
   final Database db;
@@ -68,9 +68,10 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Timer? _reconnectTimer;
   bool _reconnecting = false;
-  // Só aciona reconexão automática se a conexão foi estabelecida ao menos uma vez.
   bool _hadSuccessfulConnection = false;
-  String? _connectionError; // mensagem de erro exibida no banner
+  String? _connectionError;
+  // Papel local — cacheado para uso nos handlers de peer_joined/peer_left.
+  bool? _isAdmin;
 
   @override
   void initState() {
@@ -135,6 +136,8 @@ class _ChatScreenState extends State<ChatScreen> {
       });
 
       _peerManager!.onDataChannelReady = (ch) => _onDataChannelReady(ch);
+      _peerManager!.onPeerJoined = () { if (mounted) _onPeerJoined(); };
+      _peerManager!.onPeerLeft   = () { if (mounted) _onPeerLeft(); };
 
       debugPrint('[Chat] connecting WebSocket → $wsUrl');
       await _signalingClient!.connect();
@@ -146,10 +149,10 @@ class _ChatScreenState extends State<ChatScreen> {
       final member = await ChannelRepository(widget.db)
           .getMember(widget.channel.id, widget.currentUser.id);
 
-      final role = member?.role.name ?? 'unknown (null member)';
-      debugPrint('[Chat] local role=$role');
+      _isAdmin = member?.role == MemberRole.admin;
+      debugPrint('[Chat] local role=${member?.role.name ?? "unknown"} isAdmin=$_isAdmin');
 
-      if (member?.role == MemberRole.admin) {
+      if (_isAdmin == true) {
         debugPrint('[Chat] starting as ANSWERER (admin)');
         await _peerManager!.startAsAnswerer();
       } else {
@@ -221,12 +224,55 @@ class _ChatScreenState extends State<ChatScreen> {
     });
   }
 
+  // ─── Handlers de presença de peer ────────────────────────────────────────
+
+  /// Chamado quando um novo peer entra na room.
+  /// Member (offerer): reseta WebRTC e re-envia offer para iniciar negociação.
+  /// Admin (answerer): no-op — já está aguardando offer via _listenSignaling.
+  Future<void> _onPeerJoined() async {
+    debugPrint('[Chat] peer_joined — isAdmin=$_isAdmin');
+    if (_isAdmin == true) return;
+    _reconnecting = true; // bloqueia _scheduleReconnect durante a transição
+    _handlerMsgSub?.cancel();
+    _handler?.dispose();
+    _handler = null;
+    _syncManager = null;
+    await _peerManager?.resetWebRTC();
+    await _peerManager?.startAsOfferer();
+    _reconnecting = false;
+  }
+
+  /// Chamado quando o peer remoto sai da room.
+  /// Ambos os papéis: reseta WebRTC.
+  /// Admin: volta para modo answerer aguardando nova offer.
+  /// Member: apenas aguarda o próximo peer_joined para re-iniciar.
+  Future<void> _onPeerLeft() async {
+    debugPrint('[Chat] peer_left — resetting WebRTC');
+    _reconnecting = true;
+    _handlerMsgSub?.cancel();
+    _handler?.dispose();
+    _handler = null;
+    _syncManager = null;
+    await _peerManager?.resetWebRTC();
+    if (_isAdmin == true) {
+      await _peerManager?.startAsAnswerer();
+    }
+    _reconnecting = false;
+  }
+
   // ─── DataChannel aberto: inicia Signal Protocol + SyncManager ────────────
 
   Future<void> _onDataChannelReady(RTCDataChannel ch) async {
-    _hadSuccessfulConnection = true; // habilita reconexão automática a partir de agora
+    _hadSuccessfulConnection = true;
     debugPrint('[Chat] DataChannel OPEN — initializing Signal Protocol');
     try {
+      // Early buffer: sobrescreve ch.onMessage imediatamente (sem await) para capturar
+      // mensagens que chegam durante o init do Signal Protocol (ex: SESSION_HELLO do member).
+      // Sem isso, essas mensagens vão para _messageController → _msgSub → _onRawMessage,
+      // avançando o ratchet do member sem que o admin processe → descriptografia quebrada.
+      final earlyBuffer = <RTCDataChannelMessage>[];
+      ch.onMessage = earlyBuffer.add;
+
       final channelRepo = ChannelRepository(widget.db);
       final localMember = await channelRepo.getMember(widget.channel.id, widget.currentUser.id);
       final allMembers = await channelRepo.getMembers(widget.channel.id);
@@ -288,6 +334,18 @@ class _ChatScreenState extends State<ChatScreen> {
         if (mounted) setState(() => _messages.add(msg));
         _scrollToBottom();
       });
+
+      // Replay: processa mensagens que chegaram antes de _handler estar pronto.
+      for (final msg in earlyBuffer) {
+        await _handler!.processRawMessage(msg);
+      }
+
+      // Member envia SESSION_HELLO para completar o X3DH no lado do admin.
+      // O early buffer garante que a mensagem chega em _handleIncoming mesmo que
+      // o admin ainda esteja inicializando.
+      if (_isAdmin != true) {
+        await _handler!.sendSessionHello();
+      }
 
       await _syncManager!.startSync();
       debugPrint('[Chat] SyncManager started ✓');

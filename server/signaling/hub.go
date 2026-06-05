@@ -2,6 +2,7 @@ package signaling
 
 import (
 	"context"
+	"encoding/json"
 	"sync"
 
 	"nhooyr.io/websocket"
@@ -93,12 +94,14 @@ func (h *Hub) cleanupRoom(roomID string) {
 	}
 }
 
-// Join adiciona um peer a uma room.
+// Join adiciona um peer a uma room e notifica os peers existentes.
 func (h *Hub) Join(roomID string, p *peer) {
 	h.getOrCreateRoom(roomID).add(p)
+	// Notifica peers já presentes que um novo peer entrou (exclui o próprio entrante).
+	h.notifyPeers(roomID, p.pubKey, "peer_joined")
 }
 
-// Leave remove um peer da room e limpa a room se estiver vazia.
+// Leave remove um peer da room e notifica os peers restantes.
 func (h *Hub) Leave(roomID, pubKey string) {
 	h.mu.RLock()
 	r, ok := h.rooms[roomID]
@@ -106,8 +109,30 @@ func (h *Hub) Leave(roomID, pubKey string) {
 	if !ok {
 		return
 	}
+	// Notifica ANTES de remover para que os destinatários ainda estejam na room.
+	h.notifyPeers(roomID, pubKey, "peer_left")
 	r.remove(pubKey)
 	h.cleanupRoom(roomID)
+}
+
+// notifyPeers envia um evento gerado pelo servidor a todos os peers da room
+// exceto o peer identificado por fromPubKey.
+func (h *Hub) notifyPeers(roomID, fromPubKey, eventType string) int {
+	h.mu.RLock()
+	r, ok := h.rooms[roomID]
+	h.mu.RUnlock()
+	if !ok {
+		return 0
+	}
+	msg, err := json.Marshal(SignalMessage{
+		Type: eventType,
+		Room: roomID,
+		From: fromPubKey,
+	})
+	if err != nil {
+		return 0
+	}
+	return r.broadcast(fromPubKey, msg)
 }
 
 // Broadcast repassa uma mensagem para os outros peers da room.

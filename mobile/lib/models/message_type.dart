@@ -3,7 +3,8 @@ enum MessageType {
   image,
   audio,
   video,
-  file;
+  file,
+  sessionInit;
 
   static MessageType fromString(String s) =>
       MessageType.values.firstWhere((e) => e.name == s, orElse: () => MessageType.text);

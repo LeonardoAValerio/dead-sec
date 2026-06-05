@@ -39,7 +39,10 @@
 | **Chat — conexão WebRTC** | `_initConnection()` em `chat_screen.dart` | ✅ Conecta ao servidor |
 | **Chat — Signal Protocol** | `DataChannelHandler` wired no `_onDataChannelReady` | ✅ SPEC-CRYPTO-002 — E2E validado |
 | **Chat — X3DH assimétrico** | `_sessionReady` + `onSessionReady` + retry automático | ✅ Admin envia pending ao receber 1ª msg |
+| **Chat — SESSION_HELLO** | Member envia PreKeySignalMessage automática ao conectar | ✅ Admin completa X3DH sem depender do usuário |
+| **Chat — early buffer** | `ch.onMessage` buffered no início de `_onDataChannelReady` | ✅ Evita SESSION_HELLO ser consumida antes do handler |
 | **Chat — reenvio de pendentes** | `_retrySendPending()` ao conectar e ao X3DH completar | ✅ SPEC-MSG pendentes |
+| **Chat — peer_joined/peer_left** | Reconexão automática por eventos de presença do servidor | ✅ Member-antes-do-admin + reconexão parcial |
 | **Indicador de conexão** | `ConnectionIndicatorWidget` + `PeerConnectionManager` | ✅ SPEC-UI-001 |
 | **Status de mensagem** | `MessageStatusIcon` (⏱ ✓ ✓✓ ✓✓blue) | ✅ Funcionando |
 | **Vector Clocks** | `sync/vector_clock.dart` | ✅ Implementado |
@@ -88,6 +91,9 @@
 | **L-16** | `signal_identity_v1` ausente em keystores antigos | `KeyManager.ensureSignalIdentityKey()` no startup |
 | **L-17** | One-time pre-key não registrada na store Signal | `_buildStore` agora chama `storePreKey(1, ...)` além de `storeSignedPreKey` |
 | **L-18** | `decrypt()` tentava `SignalMessage` antes de `PreKeySignalMessage` | Ordem invertida: PreKeySignalMessage first (evita corrupção de estado) |
+| **L-19** | Member entra antes do owner → P2P nunca estabelece | Servidor faz broadcast `peer_joined`; member re-envia offer ao receber evento |
+| **L-20** | Reconexão parcial quebra P2P (um peer sai e volta) | Servidor broadcast `peer_left`; peer restante reseta WebRTC e aguarda nova offer |
+| **L-21** | Admin precisa aguardar usuário enviar mensagem para X3DH completar | `sendSessionHello()` + early buffer: member envia PreKeySignalMessage automática |
 
 ---
 
@@ -111,7 +117,7 @@ cd server
 /home/usuario/Documentos/go/bin/go run main.go
 # Saída esperada:
 # TURN server listening on UDP :3478 (realm=localhost)
-# SafeChannel signaling server on :8080
+# SafeChannel signaling server on :8000
 # WARNING: running without TLS — use only for local development
 ```
 

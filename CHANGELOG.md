@@ -5,6 +5,54 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Unreleased] — Correções de Experiência P2P: Peer Notifications + SESSION_HELLO
+
+**Foco:** Três problemas de UX na conexão P2P resolvidos: member-antes-do-owner,
+reconexão parcial e X3DH sem trigger automático.
+
+### Adicionado
+
+- **`peer_joined` / `peer_left` no servidor Go** (`hub.go`): servidor agora faz broadcast
+  de presença para peers na room — `peer_joined` quando um peer entra, `peer_left` quando
+  sai ou desconecta. Evento também disparado pelo `cleanupAllRooms` (desconexão abrupta).
+- **`PeerConnectionManager.resetWebRTC()`**: fecha `RTCPeerConnection` e DataChannel sem
+  tocar no WebSocket de sinalização. Permite re-negociação P2P mantendo o canal de controle ativo.
+- **`PeerConnectionManager.onPeerJoined` / `onPeerLeft`**: callbacks que o `ChatScreen`
+  registra para reagir a eventos de presença.
+- **`_listenSignaling()` com guard de single-subscription**: evita listeners duplicados quando
+  `startAsOfferer/Answerer` é chamado múltiplas vezes após reconexões.
+- **`ChatScreen._onPeerJoined()`**: member (offerer) reseta WebRTC e re-envia offer; admin
+  (answerer) não precisa de ação (já aguarda offer via `_listenSignaling`).
+- **`ChatScreen._onPeerLeft()`**: ambos limpam handler/syncManager e resetam WebRTC; admin
+  volta para modo answerer; member aguarda o próximo `peer_joined`.
+- **`ChatScreen._isAdmin`**: papel local cacheado para uso nos handlers de peer events,
+  evitando leituras de DB repetidas.
+- **`DataChannelHandler.sendSessionHello()`**: member envia `PreKeySignalMessage` mínima
+  (type=`sessionInit`) ao admin logo após o handler ser criado. Completa o X3DH no admin
+  sem depender de ação do usuário.
+- **`DataChannelHandler.processRawMessage()`**: método público para replay de mensagens
+  bufferizadas antes do handler estar pronto.
+- **Early buffer em `_onDataChannelReady()`**: `ch.onMessage` é sobrescrito no início da
+  função (sem await) para capturar mensagens que chegam durante o init do Signal Protocol.
+  Após o handler ser criado, o buffer é replayed via `processRawMessage()`. Resolve a race
+  condition que impedia o SESSION_HELLO de chegar ao `_handleIncoming` do admin.
+- **`SignalingMessageType.peerJoined` / `peerLeft`**: novos valores no enum para parsing
+  das mensagens de presença do servidor.
+- **`MessageType.sessionInit`**: tipo de mensagem para o SESSION_HELLO — filtrado em
+  `_handleIncoming` (completa X3DH mas não salva no DB nem emite no stream de UI).
+
+### Corrigido
+
+- **L-19** Member entra antes do owner → P2P nunca estabelece. Com `peer_joined`, o member
+  recebe notificação quando o admin entra e re-envia a offer automaticamente.
+- **L-20** Reconexão parcial (um peer sai e volta) quebra P2P. Com `peer_left`, o peer
+  restante fecha o PC antigo e entra em modo espera correto; nova conexão estabelece ao
+  receber `peer_joined` do retornante.
+- **L-21** Admin precisa aguardar mensagem do usuário para completar X3DH. Com
+  `sendSessionHello()` + early buffer, o X3DH completa automaticamente ao conectar.
+
+---
+
 ## [Unreleased] — Signal Protocol E2E + Correções de Protocolo
 
 **Foco:** Tornar a comunicação criptografada de ponta a ponta funcional em P2P local.

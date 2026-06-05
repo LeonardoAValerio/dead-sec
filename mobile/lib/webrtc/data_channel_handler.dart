@@ -85,6 +85,38 @@ class DataChannelHandler {
     }
   }
 
+  /// Envia uma mensagem Signal mínima para completar o X3DH no lado do admin.
+  /// Chamado pelo member após o handler ser criado, com early buffer garantindo
+  /// que a mensagem alcança _handleIncoming mesmo que o admin ainda esteja inicializando.
+  Future<void> sendSessionHello() async {
+    try {
+      final plaintext = utf8.encode(jsonEncode({
+        'id': 'session_hello_${DateTime.now().millisecondsSinceEpoch}',
+        'channel_id': channelId,
+        'sender_id': localUserId,
+        'type': MessageType.sessionInit.name,
+        'payload': base64Encode(Uint8List(0)),
+        'timestamp': DateTime.now().millisecondsSinceEpoch,
+        'vector_clock': <String, int>{},
+      }));
+      final payload = Uint8List.fromList(plaintext);
+      final signature = await MessageSigner.sign(payload);
+      final ciphertext = await session.encrypt(payload);
+      final sigLen = ByteData(4)..setUint32(0, signature.length, Endian.big);
+      final wire = Uint8List(4 + signature.length + ciphertext.length)
+        ..setRange(0, 4, sigLen.buffer.asUint8List())
+        ..setRange(4, 4 + signature.length, signature)
+        ..setRange(4 + signature.length, 4 + signature.length + ciphertext.length, ciphertext);
+      dataChannel.send(RTCDataChannelMessage.fromBinary(wire));
+      debugPrint('[DCH] SESSION_HELLO sent');
+    } catch (e) {
+      debugPrint('[DCH] sendSessionHello failed: $e');
+    }
+  }
+
+  /// Permite replay de mensagens bufferizadas antes de o handler estar pronto.
+  Future<void> processRawMessage(RTCDataChannelMessage msg) => _handleIncoming(msg);
+
   // ─── Recebimento ──────────────────────────────────────────────────────────
 
   Future<void> _handleIncoming(RTCDataChannelMessage raw) async {
@@ -123,6 +155,9 @@ class DataChannelHandler {
         debugPrint('[DCH] X3DH complete — session ready');
         onSessionReady?.call();
       }
+
+      // SESSION_HELLO: completa o X3DH no admin sem gerar mensagem de usuário.
+      if (msgType == MessageType.sessionInit) return;
 
       final message = Message(
         id: json['id'] as String,

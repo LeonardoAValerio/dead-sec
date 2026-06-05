@@ -36,8 +36,17 @@ class PeerConnectionManager {
   bool get isConnected => _dataChannel?.state == RTCDataChannelState.RTCDataChannelOpen;
 
   /// Chamado quando o RTCDataChannel está aberto e pronto para enviar/receber.
-  /// Usar para inicializar Signal Protocol, SyncManager e reenviar mensagens pending.
   void Function(RTCDataChannel)? onDataChannelReady;
+
+  /// Chamado quando um novo peer entra na room (server → peer_joined).
+  void Function()? onPeerJoined;
+
+  /// Chamado quando um peer sai da room (server → peer_left).
+  void Function()? onPeerLeft;
+
+  // Guard: evita double-subscribe em _listenSignaling() quando startAs* é chamado
+  // múltiplas vezes (ex: após resetWebRTC + reconnect).
+  StreamSubscription<SignalingMessage>? _signalingSubscription;
 
   PeerConnectionManager({
     required this.signalingClient,
@@ -150,7 +159,10 @@ class PeerConnectionManager {
   }
 
   void _listenSignaling() {
-    signalingClient.messages.listen((msg) async {
+    // Guard: uma única subscription por instância, independente de quantas vezes
+    // startAsOfferer/startAsAnswerer forem chamados.
+    if (_signalingSubscription != null) return;
+    _signalingSubscription = signalingClient.messages.listen((msg) async {
       switch (msg.type) {
         case SignalingMessageType.offer:
           debugPrint('[PCM] received offer — setting remote description');
@@ -176,7 +188,7 @@ class PeerConnectionManager {
             );
             _remoteDescriptionSet = true;
             await _flushPendingCandidates();
-            debugPrint('[PCM] remote description set ✓ (flushed ${_pendingCandidates.length} buffered candidates)');
+            debugPrint('[PCM] remote description set ✓');
           } catch (e) {
             debugPrint('[PCM] error handling answer: $e');
           }
@@ -198,8 +210,15 @@ class PeerConnectionManager {
             _pendingCandidates.add(candidate);
           }
 
+        case SignalingMessageType.peerJoined:
+          debugPrint('[PCM] peer_joined from=${msg.from}');
+          onPeerJoined?.call();
+
+        case SignalingMessageType.peerLeft:
+          debugPrint('[PCM] peer_left from=${msg.from}');
+          onPeerLeft?.call();
+
         default:
-          debugPrint('[PCM] unknown signaling message type: ${msg.type}');
           break;
       }
     });
@@ -251,7 +270,23 @@ class PeerConnectionManager {
     }
   }
 
+  /// Fecha a conexão WebRTC (PC + DataChannel) sem tocar no WebSocket de sinalização.
+  /// Usado quando um peer sai/volta para resetar o estado P2P mantendo o canal de
+  /// sinalização ativo. Após isso, chamar startAsOfferer() ou startAsAnswerer().
+  Future<void> resetWebRTC() async {
+    debugPrint('[PCM] resetWebRTC — closing PC and DataChannel');
+    await _dataChannel?.close();
+    await _pc?.close();
+    _dataChannel = null;
+    _pc = null;
+    _remoteDescriptionSet = false;
+    _pendingCandidates.clear();
+    _indicatorController.add(ConnectionIndicator.offline);
+  }
+
   Future<void> dispose() async {
+    await _signalingSubscription?.cancel();
+    _signalingSubscription = null;
     await _dataChannel?.close();
     await _pc?.close();
     await _messageController.close();

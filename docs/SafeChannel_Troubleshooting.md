@@ -201,9 +201,92 @@ try {
 
 **Problema:** Se qualquer mensagem binária chegar durante essa janela, vai para `_messageController` → `_msgSub` → `_onRawMessage()` (corrupção de dados).
 
-**Mitigação atual:** A janela é de poucos milissegundos (apenas DB reads + crypto setup). Mensagens manuais de usuário nunca chegam nessa janela. O SYNC_REQUEST é texto (filtrado pelo `_msgSub`).
+**Solução implementada:** No início de `_onDataChannelReady()` (antes de qualquer `await`), `ch.onMessage` é sobrescrito com um buffer local. Após o handler ser criado, todas as mensagens buffered são replayed via `DataChannelHandler.processRawMessage()`. Isso também viabiliza o SESSION_HELLO automático do member (ver BUG-09).
 
-**Solução definitiva (futuro):** Buffer de mensagens binárias no `_msgSub` com replay via `DataChannelHandler.processRawMessage()` após o handler ser criado. Não implementado no MVP por aumentar complexidade sem benefício prático observado.
+---
+
+---
+
+## BUG-07 — Member entra antes do owner: P2P nunca estabelece
+
+**Sintoma:** Se Bob (member/offerer) entra no canal antes de Alice (admin/answerer), o indicador fica cinza para ambos indefinidamente. Alice entra depois mas a conexão não acontece.
+
+**Causa raiz:** O papel é determinado pelo role no DB (admin=answerer, member=offerer), independente da ordem de chegada. Quando Bob entra primeiro:
+1. Bob envia offer → servidor faz broadcast → `delivered_to=0` (Alice não está na room) → offer perdida
+2. Alice entra depois → chama `startAsAnswerer()` → aguarda offer que nunca chega
+
+O servidor **não notificava peers existentes quando um novo peer entrava**. A mensagem `join` era apenas registrada no hub sem broadcast para outros.
+
+**Arquivos afetados:** `server/signaling/hub.go`, `mobile/lib/webrtc/peer_connection_manager.dart`, `mobile/lib/ui/chat/chat_screen.dart`
+
+**Solução:** Servidor faz broadcast de `peer_joined` quando um peer entra na room:
+```go
+// hub.go — Join()
+func (h *Hub) Join(roomID string, p *peer) {
+    h.getOrCreateRoom(roomID).add(p)
+    h.notifyPeers(roomID, p.pubKey, "peer_joined") // novo
+}
+```
+O member (offerer) recebe `peer_joined` → reseta WebRTC → envia nova offer:
+```dart
+// chat_screen.dart
+Future<void> _onPeerJoined() async {
+  if (_isAdmin == true) return; // admin só aguarda offer
+  await _peerManager?.resetWebRTC();
+  await _peerManager?.startAsOfferer(); // nova offer para o admin recém-chegado
+}
+```
+
+---
+
+## BUG-08 — Reconexão parcial quebra P2P
+
+**Sintoma:** Alice e Bob estão conectados. Um deles sai do canal e volta. A conexão P2P não se restabelece — é necessário os dois saírem, o owner entrar e o member entrar.
+
+**Causa raiz:** Quando um peer faz `leave`, o servidor **não notificava o peer restante**. O peer restante ficava com `RTCPeerConnection` em estado morto. Quando o peer saído voltava, o peer restante ainda tinha o PC antigo em estado inconsistente.
+
+**Arquivos afetados:** `server/signaling/hub.go`, `mobile/lib/webrtc/peer_connection_manager.dart`, `mobile/lib/ui/chat/chat_screen.dart`
+
+**Solução:** Servidor faz broadcast de `peer_left` quando um peer sai:
+```go
+// hub.go — Leave()
+func (h *Hub) Leave(roomID, pubKey string) {
+    h.notifyPeers(roomID, pubKey, "peer_left") // notifica ANTES de remover
+    r.remove(pubKey)
+    h.cleanupRoom(roomID)
+}
+```
+Peer restante recebe `peer_left` → fecha WebRTC (mantém WebSocket de sinalização):
+```dart
+Future<void> _onPeerLeft() async {
+  await _peerManager?.resetWebRTC(); // fecha PC+DataChannel, mantém signaling
+  if (_isAdmin == true) {
+    await _peerManager?.startAsAnswerer(); // volta ao modo espera
+  }
+  // member apenas aguarda o próximo peer_joined
+}
+```
+Quando o peer saído retorna: servidor envia `peer_joined` → member re-envia offer → conexão estabelecida.
+
+**Detalhe:** `PeerConnectionManager.resetWebRTC()` fecha PC + DataChannel sem tocar no WebSocket. `_listenSignaling()` tem guard de single-subscription para que `startAsAnswerer()/startAsOfferer()` chamados múltiplas vezes não criem listeners duplicados.
+
+---
+
+## BUG-09 — Admin precisa aguardar mensagem do usuário para X3DH completar
+
+**Sintoma:** Após conectar, o admin tenta enviar uma mensagem mas ela fica como pending indefinidamente — a não ser que o member envie algo primeiro.
+
+**Causa raiz:** X3DH é assimétrico. O admin (responder) completa o ratchet **apenas ao descriptografar** a primeira `PreKeySignalMessage` do member. Sem uma mensagem automática do member ao conectar, o admin fica bloqueado até o usuário digitar.
+
+**Tentativa anterior:** `sendSessionHello()` implementado mas falhou porque a mensagem chegava ao admin antes de `_handler` ser criado (janela de race condition) → consumida por `_msgSub → _onRawMessage` → ratchet do member avançava → mensagens subsequentes eram `SignalMessage` que o admin não conseguia descriptografar.
+
+**Solução — early buffer + SESSION_HELLO:**
+1. No início de `_onDataChannelReady()` (antes de qualquer await), `ch.onMessage` é sobrescrito para bufferizar mensagens
+2. Após o handler ser criado, o buffer é replayed via `processRawMessage()`
+3. Member chama `sendSessionHello()` que envia uma `PreKeySignalMessage` mínima (type=sessionInit)
+4. Admin recebe via `_handleIncoming` → descriptografa → X3DH completa → `onSessionReady` → retry dos pending
+
+**Arquivos afetados:** `mobile/lib/webrtc/data_channel_handler.dart`, `mobile/lib/ui/chat/chat_screen.dart`, `mobile/lib/models/message_type.dart`
 
 ---
 

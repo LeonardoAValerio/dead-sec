@@ -96,7 +96,7 @@ type serverConfig struct {
 
 func loadConfig() serverConfig {
 	return serverConfig{
-		Port:       getEnv("PORT", "8080"),
+		Port:       getEnv("PORT", "8000"),
 		Domain:     getEnv("DOMAIN", "localhost"),
 		PublicIP:   getEnv("PUBLIC_IP", "127.0.0.1"),
 		JWTSecret:  getEnv("JWT_SECRET", "change-me-in-production"),

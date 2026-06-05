@@ -3,7 +3,7 @@ import 'dart:convert';
 
 import 'package:web_socket_channel/web_socket_channel.dart';
 
-enum SignalingMessageType { offer, answer, iceCandidate, join, leave, unknown }
+enum SignalingMessageType { offer, answer, iceCandidate, join, leave, peerJoined, peerLeft, unknown }
 
 class SignalingMessage {
   final SignalingMessageType type;
@@ -26,6 +26,8 @@ class SignalingMessage {
       'ice-candidate' => SignalingMessageType.iceCandidate,
       'join' => SignalingMessageType.join,
       'leave' => SignalingMessageType.leave,
+      'peer_joined' => SignalingMessageType.peerJoined,
+      'peer_left' => SignalingMessageType.peerLeft,
       _ => SignalingMessageType.unknown,
     };
     return SignalingMessage(
