@@ -116,6 +116,7 @@ class KeyManager {
 
   /// Deriva a chave de criptografia do banco a partir do PIN via Argon2id.
   /// Parâmetros: memória 64MB, iterações 3, paralelismo 4 (SPEC-CHAN-002).
+  /// O cálculo pesado roda em isolate separado para não bloquear a UI nem causar ANR.
   static Future<String> deriveDbKey(String pin) async {
     String? saltB64 = await _read(_kDbKeySalt);
     late Uint8List salt;
@@ -133,6 +134,14 @@ class KeyManager {
       salt = base64Decode(saltB64);
     }
 
+    final pinBytes = Uint8List.fromList(utf8.encode(pin));
+    return compute(_argon2DeriveIsolate, [pinBytes, salt]);
+  }
+
+  // Função top-level equivalente exigida pelo compute() — roda em isolate separado.
+  static String _argon2DeriveIsolate(List<Uint8List> args) {
+    final pinBytes = args[0];
+    final salt = args[1];
     final params = pc.Argon2Parameters(
       pc.Argon2Parameters.ARGON2_id,
       salt,
@@ -142,7 +151,6 @@ class KeyManager {
       lanes: 4,
     );
     final generator = pc.Argon2BytesGenerator()..init(params);
-    final pinBytes = Uint8List.fromList(utf8.encode(pin));
     final key = Uint8List(32);
     generator.deriveKey(pinBytes, 0, key, 0);
     return base64Encode(key);

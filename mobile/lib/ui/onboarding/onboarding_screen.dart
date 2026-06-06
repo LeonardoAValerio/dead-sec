@@ -132,7 +132,8 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
           MaterialPageRoute(builder: (_) => ContactsScreen(db: db, currentUser: user)),
         );
       }
-    } catch (e) {
+    } catch (e, st) {
+      debugPrint('Onboarding error: $e\n$st');
       setState(() => _error = 'Erro ao criar conta. Tente novamente.');
     } finally {
       setState(() => _loading = false);

@@ -34,7 +34,9 @@ Future<Database> _openMobileDatabase(String encryptionKey) async {
     version: 1,
     onCreate: _createSchema,
     onConfigure: (db) async {
-      await db.execute('PRAGMA journal_mode=WAL');
+      // PRAGMA journal_mode retorna resultado — rawQuery no lugar de execute
+      // (execSQL do Android rejeita statements que retornam linhas)
+      await db.rawQuery('PRAGMA journal_mode=WAL');
       await db.execute('PRAGMA foreign_keys=ON');
     },
   );
