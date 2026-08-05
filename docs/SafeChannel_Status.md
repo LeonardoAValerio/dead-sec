@@ -1,8 +1,8 @@
 # SafeChannel — Status de Implementação
 
-**Versão:** MVP + P1/P2  
-**Data:** 2026-06-01  
-**Estado:** Signal Protocol E2E funcionando em P2P local, comunicação bidirecional validada
+**Versão:** v0.2  
+**Data:** 2026-06-09  
+**Estado:** v0.2 implementada — biometria, notificações, detalhes do canal, QR do chat, troca de PIN, validação de senha
 
 ---
 
@@ -31,10 +31,15 @@
 | **Multi-instância local** | `INSTANCE_ID` via `--dart-define` (chaves + banco separados) | ✅ Para testes |
 | **Onboarding** | `ui/onboarding/onboarding_screen.dart` | ✅ Funcionando |
 | **PIN unlock** | `main.dart` → `_PinUnlockScreen` | ✅ Funcionando |
+| **Biometria** | `_PinUnlockScreen` tenta biometria se habilitada; fallback silencioso no desktop | ✅ v0.2 |
+| **Troca de PIN** | `SettingsScreen` — verifica PIN antigo, PRAGMA rekey, atualiza chave biométrica | ✅ v0.2 |
 | **Criação de canal** | `pairing_service.dart` + `create_channel_screen.dart` | ✅ Funcionando |
+| **Validação de senha (SPEC-CHAN-002)** | 8 chars mínimo em `CreateChannelScreen` e `JoinCodeScreen` | ✅ v0.2 |
 | **Ingresso por código** | `invite_code_service.dart` + `join_code_screen.dart` | ✅ Funcionando (sik+spksig incluídos) |
 | **Ingresso por QR Code** | `pairing_service.dart` + `qr_scan_screen.dart` | ✅ Mobile; ⚠️ desktop sem câmera |
 | **Lista de canais** | `ui/contacts/contacts_screen.dart` | ✅ Funcionando |
+| **Detalhes do canal** | `ui/channels/channel_details_screen.dart` — membros, info, botão convidar | ✅ v0.2 |
+| **QR de convite do chat** | `InviteQrSheet` via ícone ⓘ no AppBar do ChatScreen | ✅ v0.2 |
 | **Chat — mensagens locais** | `ui/chat/chat_screen.dart` + `MessageRepository` | ✅ Funcionando |
 | **Chat — conexão WebRTC** | `_initConnection()` em `chat_screen.dart` | ✅ Conecta ao servidor |
 | **Chat — Signal Protocol** | `DataChannelHandler` wired no `_onDataChannelReady` | ✅ SPEC-CRYPTO-002 — E2E validado |
@@ -48,6 +53,9 @@
 | **Vector Clocks** | `sync/vector_clock.dart` | ✅ Implementado |
 | **Sync Manager** | `sync/sync_manager.dart` — disparado ao DataChannel abrir | ✅ SPEC-SYNC-001 |
 | **Navegação pós-join** | Auto-navegar ao chat após entrar via código | ✅ P2-C |
+| **Notificações locais** | `NotificationService` — peer_joined + nova mensagem (desktop Linux + Android + iOS) | ✅ v0.2 |
+| **Toggle notificações** | `SettingsScreen` — seção NOTIFICAÇÕES com SwitchListTile | ✅ v0.2 |
+| **Toggle biometria** | `SettingsScreen` — seção SEGURANÇA (oculto automaticamente se indisponível) | ✅ v0.2 |
 
 ### Testes automatizados (`mobile/test/`)
 
@@ -57,8 +65,10 @@
 | `test/crypto/message_signer_test.dart` | Ed25519 sign/verify, payload alterado, chave errada | ✅ 4 testes |
 | `test/sync/vector_clock_test.dart` | increment, merge, happensBefore, isConcurrentWith | ✅ 5 testes |
 | `test/sync/sync_manager_test.dart` | SYNC_REQUEST → RESPONSE → ACK | ✅ 3 testes |
-| `test/webrtc/invite_code_service_test.dart` | encode/decode, senha, expiração | ✅ 7 testes |
-| **Total** | | **✅ 22 testes passando** |
+| `test/webrtc/invite_code_service_test.dart` | encode/decode, senha, expiração, validação 8 chars | ✅ 11 testes |
+| `test/services/notification_service_test.dart` | isEnabled default, setEnabled round-trip | ✅ 3 testes |
+| `test/services/biometric_service_test.dart` | isEnabled default, isAvailable sem crash, disable idempotente | ✅ 3 testes |
+| **Total** | | **✅ 33 testes passando** |
 
 ---
 
@@ -69,11 +79,16 @@
 | ID | Problema |
 |---|---|
 | **L-09** | QR Code scanner indisponível no Linux desktop (mobile_scanner não suporta) — já tratado com mensagem de fallback |
-| **L-10** | Senha de convite mínima de 8 chars (SPEC-CHAN-002) não validada na UI |
-| **L-11** | Sem tela de detalhes do canal (membros, QR de convite a partir do chat) |
 | **L-12** | Sem suporte a mídia (imagens, áudio, vídeo) |
 
-### Resolvidos nesta iteração
+### Resolvidos nesta iteração (v0.2)
+
+| ID | Era | Resolvido por |
+|---|---|---|
+| **L-10** | Senha de convite mínima de 8 chars não validada | `CreateChannelScreen._create()` + `JoinCodeScreen._join()` |
+| **L-11** | Sem tela de detalhes do canal | `ChannelDetailsScreen` + `InviteQrSheet` via AppBar ⓘ |
+
+### Resolvidos em iterações anteriores
 
 | ID | Era | Resolvido por |
 |---|---|---|
@@ -150,8 +165,8 @@ Isso limpa as chaves do keyring E deleta o arquivo de banco de dados da instânc
 
 ```bash
 cd mobile
-flutter test test/crypto/ test/sync/ test/webrtc/
-# Esperado: All tests passed! (22 testes)
+flutter test test/crypto/ test/sync/ test/webrtc/ test/services/
+# Esperado: All tests passed! (33 testes)
 ```
 
 ### Fluxo completo de teste P2P
@@ -163,26 +178,43 @@ flutter test test/crypto/ test/sync/ test/webrtc/
 5. **Bob:** indicador 🟢 (P2P direto via loopback) → Signal Protocol handshake automático
 6. Trocar mensagens — trafegam com Double Ratchet (SPEC-CRYPTO-002)
 
+### Fluxo de teste das features v0.2
+
+**Validação de senha:**
+- Criar canal com senha de 3 chars → bloqueado: "A senha deve ter pelo menos 8 caracteres."
+- Criar canal com senha de 8+ chars → funciona normalmente
+
+**Detalhes do canal + QR do chat:**
+- Abrir chat → ícone ⓘ no AppBar → ver lista de membros com badge Admin/Membro
+- Tap "Gerar convite" → bottom sheet com QR (5 min) + código de texto + botão copiar
+- Aguardar 5 min → QR expira → "Gerar novo QR" regenera
+
+**Biometria:**
+- Settings → SEGURANÇA → toggle Biometria (invisível no Linux sem hardware)
+- Ao ativar: prompt de PIN para confirmar → biometria habilitada
+- Fechar app → reabrir → tela biométrica; cancelar → cai para PIN
+
+**Notificações:**
+- Settings → NOTIFICAÇÕES → toggle desabilita/habilita
+- Com app minimizado: peer entra no canal → notificação do sistema aparece
+
+**Troca de PIN:**
+- Settings → SEGURANÇA → Trocar PIN → preencher PIN atual + novo + confirmar
+- PIN atual errado → erro silencioso no SnackBar
+- Fechar e reabrir app → novo PIN funciona, PIN antigo rejeitado
+
 ---
 
 ## 4. Próximas Implementações (Priorizadas)
 
-### Prioridade 1 — v0.2 (Grupos + UX)
-
-- Tela de detalhes do canal (membros, QR de convite a partir do chat)
-- QR generator acessível do chat (não só na criação)
-- Validação de senha mínima 8 chars (SPEC-CHAN-002)
-- Biometria como alternativa ao PIN
-- Notificações locais
-
-### Prioridade 2 — v0.3 (Mídia)
+### Prioridade 1 — v0.3 (Mídia)
 
 - Envio de imagens (JPEG/PNG/WebP)
 - Chunking com SHA-256 por chunk (SPEC-MSG-002)
 - Preview/thumbnail
 - Áudio (Opus/AAC)
 
-### Prioridade 3 — v1.0 (Produção)
+### Prioridade 2 — v1.0 (Produção)
 
 - Auditoria de segurança externa
 - TLS real no servidor (Let's Encrypt)
@@ -199,11 +231,11 @@ mobile/lib/
 ├── core/
 │   └── app_colors.dart
 ├── crypto/
-│   ├── key_manager.dart         # Ed25519 (signing) + X25519 (DH) + X25519 (Signal identity)
+│   ├── key_manager.dart         # Ed25519 + X25519 + rotateSalt() para troca de PIN
 │   ├── message_signer.dart      # Ed25519 sign/verify (SPEC-MSG-001) ✅ wired
 │   └── signal_session.dart      # X3DH + Double Ratchet (SPEC-CRYPTO-002) ✅ wired
 ├── db/
-│   ├── database.dart            # SQLCipher (mobile) / FFI path real (desktop)
+│   ├── database.dart            # SQLCipher (mobile) / FFI path real (desktop) + rekeyDatabase()
 │   └── repositories/
 │       ├── channel_repository.dart
 │       ├── message_repository.dart
@@ -212,28 +244,36 @@ mobile/lib/
 │   ├── channel.dart, channel_member.dart  # + signalKey, signalPreKey, signalPreKeySig
 │   ├── message.dart, message_status.dart, message_type.dart
 │   └── user.dart
+├── services/
+│   ├── biometric_service.dart   # local_auth wrapper com fallback silencioso no desktop
+│   └── notification_service.dart # flutter_local_notifications (Linux + Android + iOS)
 ├── sync/
 │   ├── vector_clock.dart        # Map<String,int> causal ordering
 │   └── sync_manager.dart        # Delta sync protocol ✅ disparado ao conectar
 ├── ui/
+│   ├── channels/
+│   │   └── channel_details_screen.dart  # Membros + info + botão convidar (v0.2)
 │   ├── chat/
-│   │   └── chat_screen.dart     # Signal wired + SyncManager + pending retry
+│   │   └── chat_screen.dart     # Signal wired + SyncManager + pending retry + notif + ⓘ AppBar
 │   ├── contacts/
 │   │   └── contacts_screen.dart # Auto-navega após join
 │   ├── onboarding/
 │   │   └── onboarding_screen.dart
 │   ├── pairing/
-│   │   ├── create_channel_screen.dart
-│   │   ├── join_code_screen.dart
+│   │   ├── create_channel_screen.dart   # Validação senha ≥8 chars (v0.2)
+│   │   ├── join_code_screen.dart        # Validação senha ≥8 chars (v0.2)
 │   │   ├── qr_generate_screen.dart
 │   │   └── qr_scan_screen.dart
+│   ├── settings/
+│   │   └── settings_screen.dart # Notif + biometria toggle + trocar PIN (v0.2)
 │   └── shared/
 │       ├── connection_indicator.dart
+│       ├── invite_qr_sheet.dart         # QR reutilizável para canal existente (v0.2)
 │       └── message_status_icon.dart
 └── webrtc/
     ├── data_channel_handler.dart    # Signal encrypt/sign + onControlMessage ✅ wired
     ├── invite_code_service.dart     # AES-256-GCM corrigido
-    ├── pairing_service.dart         # QrPayload com sik + spksig
+    ├── pairing_service.dart         # QrPayload + generateInviteQr() (v0.2)
     ├── peer_connection_manager.dart # + onDataChannelReady callback
     ├── signaling_client.dart
     └── turn_credentials_service.dart
@@ -242,11 +282,14 @@ mobile/test/
 ├── crypto/
 │   ├── signal_session_test.dart    # X3DH + Double Ratchet ✅
 │   └── message_signer_test.dart    # Ed25519 sign/verify ✅
+├── services/
+│   ├── biometric_service_test.dart # isAvailable sem crash, disable idempotente ✅
+│   └── notification_service_test.dart # isEnabled/setEnabled round-trip ✅
 ├── sync/
 │   ├── vector_clock_test.dart      # Causal ordering ✅
 │   └── sync_manager_test.dart      # Sync protocol ✅
 └── webrtc/
-    └── invite_code_service_test.dart  # AES-256-GCM + Argon2id ✅
+    └── invite_code_service_test.dart  # AES-256-GCM + Argon2id + validação 8 chars ✅
 
 server/
 ├── main.go
@@ -273,3 +316,7 @@ server/
 | `openTestDatabase()` para testes | `openAppDatabase` com flag de teste | Testes não devem tocar no banco de produção (`~/.local/share/safechannel/`) |
 | GCM `sublist(0, l1+l2)` em vez de buffer completo | `getOutputSize` oversized | pointycastle 4.x aloca mais espaço que o escrito; bytes extras zerados corrompiam o MAC |
 | `context.Background()` no broadcast do Go | Context com timeout | Mensagens de sinalização são curtas; timeout adicionaria complexidade sem benefício real |
+| Biometria armazena DB key derivada no `flutter_secure_storage` | Re-derivar via PIN no unlock biométrico | PIN não é armazenado — biometria precisa da chave pronta para abrir o banco |
+| `rotateSalt()` + `PRAGMA rekey` na troca de PIN | Só trocar o salt | Sem rekey, o banco permanece aberto com a chave antiga (inconsistência) |
+| `WidgetsBindingObserver` no ChatScreen para foreground | Sempre notificar | Evita notificações duplicadas quando o usuário está com o app aberto |
+| `generateInviteQr(channel)` separado de `createChannel()` | Reusar createChannel | createChannel grava no banco; gerar QR para canal existente não deve criar duplicatas |

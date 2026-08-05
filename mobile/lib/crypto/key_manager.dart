@@ -156,6 +156,21 @@ class KeyManager {
     return base64Encode(key);
   }
 
+  /// Gera um novo salt aleatório, salva e deriva uma nova chave a partir do pin.
+  /// Deve ser chamado durante a troca de PIN, DEPOIS de verificar o PIN antigo.
+  static Future<String> rotateSalt(String pin) async {
+    final rng = pc.SecureRandom('Fortuna')
+      ..seed(pc.KeyParameter(Uint8List.fromList(
+        List.generate(32, (_) => DateTime.now().microsecondsSinceEpoch & 0xFF),
+      )));
+    final salt = Uint8List(32);
+    for (var i = 0; i < 32; i++) {
+      salt[i] = rng.nextUint8();
+    }
+    await _write(_kDbKeySalt, base64Encode(salt));
+    return compute(_argon2DeriveIsolate, [Uint8List.fromList(utf8.encode(pin)), salt]);
+  }
+
   static Future<bool> hasKeys() async {
     final key = await _read(_kIdentityKey);
     return key != null;

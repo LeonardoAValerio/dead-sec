@@ -24,6 +24,8 @@ import '../../webrtc/data_channel_handler.dart';
 import '../../webrtc/peer_connection_manager.dart';
 import '../../webrtc/signaling_client.dart';
 import '../../webrtc/turn_credentials_service.dart';
+import '../../services/notification_service.dart';
+import '../channels/channel_details_screen.dart';
 import '../shared/connection_indicator.dart';
 import '../shared/message_status_icon.dart';
 
@@ -46,39 +48,48 @@ class ChatScreen extends StatefulWidget {
   State<ChatScreen> createState() => _ChatScreenState();
 }
 
-class _ChatScreenState extends State<ChatScreen> {
+class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   late final MessageRepository _repo;
   final _textCtrl = TextEditingController();
   final _scrollCtrl = ScrollController();
 
   List<Message> _messages = [];
+  Map<String, String> _memberNames = {};
   ConnectionIndicator _indicator = ConnectionIndicator.offline;
 
-  // Guardados como campos para fechar corretamente no dispose / reconexão.
+  // Sinalização compartilhada por todas as conexões do canal.
   SignalingClient? _signalingClient;
+  TurnCredentialsService? _turnService;
   String? _pubKeyB64;
 
-  PeerConnectionManager? _peerManager;
-  DataChannelHandler? _handler;
-  SyncManager? _syncManager;
+  // Topologia mesh: um PCM + handler + syncManager por peer remoto (chave = pubKey do peer).
+  final _peerManagers  = <String, PeerConnectionManager>{};
+  final _handlers      = <String, DataChannelHandler>{};
+  final _syncManagers  = <String, SyncManager>{};
+  final _indicatorSubs = <String, StreamSubscription<ConnectionIndicator>>{};
+  final _handlerMsgSubs = <String, StreamSubscription<Message>>{};
+  final _indicatorStates = <String, ConnectionIndicator>{};
 
-  StreamSubscription<ConnectionIndicator>? _indicatorSub;
-  StreamSubscription? _msgSub;
-  StreamSubscription<Message>? _handlerMsgSub;
+  // Subscription global para eventos de presença (peer_joined, peer_left, room_peers).
+  StreamSubscription<SignalingMessage>? _globalSignalingSub;
 
-  Timer? _reconnectTimer;
-  bool _reconnecting = false;
-  bool _hadSuccessfulConnection = false;
   String? _connectionError;
-  // Papel local — cacheado para uso nos handlers de peer_joined/peer_left.
-  bool? _isAdmin;
+  bool _appInForeground = true;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _repo = MessageRepository(widget.db);
+    _memberNames = {widget.currentUser.id: widget.currentUser.displayName};
     _loadHistory();
+    _loadMemberNames();
     _initConnection();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _appInForeground = state == AppLifecycleState.resumed;
   }
 
   Future<void> _loadHistory() async {
@@ -86,10 +97,20 @@ class _ChatScreenState extends State<ChatScreen> {
     if (mounted) setState(() => _messages = msgs);
   }
 
-  // ─── Conexão WebRTC ───────────────────────────────────────────────────────
+  Future<void> _loadMemberNames() async {
+    final members = await ChannelRepository(widget.db).getMembers(widget.channel.id);
+    if (!mounted) return;
+    setState(() {
+      for (final m in members) {
+        if (m.displayName.isNotEmpty) _memberNames[m.userId] = m.displayName;
+      }
+    });
+  }
+
+  // ─── Conexão com o servidor de sinalização ────────────────────────────────
 
   Future<void> _initConnection() async {
-    debugPrint('[Chat] _initConnection start — channel=${widget.channel.id.substring(0, 8)}');
+    debugPrint('[Chat] _initConnection — channel=${widget.channel.id.substring(0, 8)}');
     try {
       final identityPair = await KeyManager.loadIdentityKeyPair();
       final pubBytes = (await identityPair.extractPublicKey()).bytes;
@@ -101,7 +122,6 @@ class _ChatScreenState extends State<ChatScreen> {
         Uri.parse('$_kServerUrl/auth/token?pk=${Uri.encodeComponent(_pubKeyB64!)}'),
       ).timeout(const Duration(seconds: 4));
 
-      debugPrint('[Chat] /auth/token → status=${tokenResp.statusCode}');
       if (tokenResp.statusCode != 200) {
         debugPrint('[Chat] token request failed — offline mode');
         return;
@@ -110,62 +130,21 @@ class _ChatScreenState extends State<ChatScreen> {
 
       final wsUrl = _kServerUrl.replaceFirst(RegExp(r'^http'), 'ws');
       _signalingClient = SignalingClient(serverUrl: wsUrl, jwtToken: jwt);
-      final turnService = TurnCredentialsService(serverUrl: _kServerUrl, jwtToken: jwt);
+      _turnService = TurnCredentialsService(serverUrl: _kServerUrl, jwtToken: jwt);
 
-      _peerManager = PeerConnectionManager(
-        signalingClient: _signalingClient!,
-        turnService: turnService,
-        roomId: widget.channel.id,
-        localPubKey: _pubKeyB64!,
-      );
-
-      _indicatorSub = _peerManager!.onIndicator.listen((s) {
-        debugPrint('[Chat] indicator → $s');
-        if (!mounted) return;
-        setState(() => _indicator = s);
-        // Quando a conexão cai, agenda reconexão automática.
-        if (s == ConnectionIndicator.offline) _scheduleReconnect();
-      });
-
-      // Fallback raw stream — substituído pelo handler quando Signal estiver pronto.
-      // Texto é sempre protocolo de controle (SYNC_REQUEST/RESPONSE/ACK), nunca dado de usuário.
-      _msgSub = _peerManager!.onMessage.listen((rtcMsg) {
-        if (_handler != null) return;
-        if (!rtcMsg.isBinary) return;
-        _onRawMessage(rtcMsg.binary);
-      });
-
-      _peerManager!.onDataChannelReady = (ch) => _onDataChannelReady(ch);
-      _peerManager!.onPeerJoined = () { if (mounted) _onPeerJoined(); };
-      _peerManager!.onPeerLeft   = () { if (mounted) _onPeerLeft(); };
-
-      debugPrint('[Chat] connecting WebSocket → $wsUrl');
       await _signalingClient!.connect();
       debugPrint('[Chat] WebSocket connected ✓');
 
+      // Subscription global: trata eventos de presença para todo o mesh.
+      // Deve vir APÓS connect() — _controller só existe depois de connect().
+      _globalSignalingSub = _signalingClient!.messages.listen(_onSignalingEvent);
+
       _signalingClient!.join(widget.channel.id, _pubKeyB64!);
       debugPrint('[Chat] joined room ${widget.channel.id.substring(0, 8)}…');
-
-      final member = await ChannelRepository(widget.db)
-          .getMember(widget.channel.id, widget.currentUser.id);
-
-      _isAdmin = member?.role == MemberRole.admin;
-      debugPrint('[Chat] local role=${member?.role.name ?? "unknown"} isAdmin=$_isAdmin');
-
-      if (_isAdmin == true) {
-        debugPrint('[Chat] starting as ANSWERER (admin)');
-        await _peerManager!.startAsAnswerer();
-      } else {
-        debugPrint('[Chat] starting as OFFERER (member)');
-        await _peerManager!.startAsOfferer();
-      }
-      debugPrint('[Chat] _initConnection complete');
     } on TimeoutException {
       debugPrint('[Chat] timeout reaching server — offline mode');
     } catch (e, stack) {
       debugPrint('[Chat] _initConnection error: $e\n$stack');
-      // Chaves ausentes do keyring: provavelmente reset ou keyring bloqueado no Linux.
-      // Não tem sentido reconectar — exibe aviso e para o ciclo de reconnect.
       if (e is StateError &&
           (e.message.contains('Identity key not found') ||
            e.message.contains('Signed pre-key not found') ||
@@ -176,216 +155,349 @@ class _ChatScreenState extends State<ChatScreen> {
               'Execute o app com --dart-define=RESET_ON_START=true\n'
               'para refazer o onboarding.');
         }
-        _reconnecting = false; // para o loop
       }
     }
   }
 
-  // ─── Teardown + Reconexão ─────────────────────────────────────────────────
+  // ─── Eventos globais de sinalização ──────────────────────────────────────
 
-  /// Destrói a conexão atual e limpa todos os recursos WebRTC/Signal.
-  /// Envia `leave` ao servidor para remover o peer da room ANTES de fechar o WebSocket,
-  /// evitando que o `cleanupAllRooms` do servidor derrube um peer recém-reconectado.
-  Future<void> _tearDownConnection() async {
-    _reconnectTimer?.cancel();
-    _indicatorSub?.cancel();
-    _msgSub?.cancel();
-    _handlerMsgSub?.cancel();
-    _handler?.dispose();
-    _handler = null;
-    _syncManager = null;
-
-    if (_signalingClient != null && _pubKeyB64 != null) {
-      debugPrint('[Chat] sending leave before closing WebSocket');
-      _signalingClient!.leave(widget.channel.id, _pubKeyB64!);
+  void _onSignalingEvent(SignalingMessage msg) {
+    if (!mounted) return;
+    switch (msg.type) {
+      case SignalingMessageType.peerJoined:
+        debugPrint('[Chat] peer_joined from=${msg.from.substring(0, 8)}…');
+        _onPeerJoined(msg.from);
+      case SignalingMessageType.peerLeft:
+        debugPrint('[Chat] peer_left from=${msg.from.substring(0, 8)}…');
+        _onPeerLeft(msg.from);
+      case SignalingMessageType.roomPeers:
+        final peers = (msg.data['peers'] as List<dynamic>?)?.cast<String>() ?? [];
+        debugPrint('[Chat] room_peers — ${peers.length} existing peer(s)');
+        _onRoomPeers(peers);
+      default:
+        break;
     }
-    await _signalingClient?.close();
-    _signalingClient = null;
-
-    await _peerManager?.dispose();
-    _peerManager = null;
   }
 
-  /// Agenda reconexão automática 3s após a queda.
-  /// Só dispara se a conexão foi estabelecida ao menos uma vez e não há erro de chaves.
-  void _scheduleReconnect() {
-    if (_reconnecting) return;
-    if (!_hadSuccessfulConnection) return; // não reconecta se nunca conectou
-    if (_connectionError != null) return;  // não reconecta se há erro de chaves
-    _reconnecting = true;
-    debugPrint('[Chat] connection lost — reconnecting in 3s…');
-    _reconnectTimer?.cancel();
-    _reconnectTimer = Timer(const Duration(seconds: 3), () async {
+  // ─── Gestão de conexões por peer ─────────────────────────────────────────
+
+  /// Novo peer entrou na sala → somos answerer para ele.
+  Future<void> _onPeerJoined(String remotePK) async {
+    if (!_appInForeground) NotificationService.notifyPeerJoined(widget.channel.name);
+    // Se já existe uma conexão (peer reconectou), descarta a anterior.
+    if (_peerManagers.containsKey(remotePK)) {
+      await _disposePeer(remotePK);
+    }
+    await _createPeerConnection(remotePK, isOfferer: false);
+  }
+
+  /// Recebemos lista de peers já presentes → somos o novo joiner, offerer para cada um.
+  Future<void> _onRoomPeers(List<String> peerPKs) async {
+    for (final remotePK in peerPKs) {
+      if (!_peerManagers.containsKey(remotePK)) {
+        await _createPeerConnection(remotePK, isOfferer: true);
+      }
+    }
+  }
+
+  /// Peer saiu da sala → descarta recursos da conexão com ele.
+  Future<void> _onPeerLeft(String remotePK) async {
+    await _disposePeer(remotePK);
+    _updateIndicator();
+  }
+
+  /// Cria e configura um [PeerConnectionManager] para [remotePK].
+  Future<void> _createPeerConnection(String remotePK, {required bool isOfferer}) async {
+    if (_signalingClient == null || _turnService == null || _pubKeyB64 == null) return;
+
+    final pcm = PeerConnectionManager(
+      signalingClient: _signalingClient!,
+      turnService: _turnService!,
+      roomId: widget.channel.id,
+      localPubKey: _pubKeyB64!,
+      remotePubKey: remotePK,
+    );
+    _peerManagers[remotePK] = pcm;
+
+    _indicatorSubs[remotePK] = pcm.onIndicator.listen((s) {
       if (!mounted) return;
-      debugPrint('[Chat] attempting reconnect');
-      await _tearDownConnection();
-      _reconnecting = false;
-      if (mounted) await _initConnection();
+      _indicatorStates[remotePK] = s;
+      _updateIndicator();
     });
-  }
 
-  // ─── Handlers de presença de peer ────────────────────────────────────────
+    pcm.onDataChannelReady = (ch) => _onDataChannelReady(ch, remotePK);
 
-  /// Chamado quando um novo peer entra na room.
-  /// Member (offerer): reseta WebRTC e re-envia offer para iniciar negociação.
-  /// Admin (answerer): no-op — já está aguardando offer via _listenSignaling.
-  Future<void> _onPeerJoined() async {
-    debugPrint('[Chat] peer_joined — isAdmin=$_isAdmin');
-    if (_isAdmin == true) return;
-    _reconnecting = true; // bloqueia _scheduleReconnect durante a transição
-    _handlerMsgSub?.cancel();
-    _handler?.dispose();
-    _handler = null;
-    _syncManager = null;
-    await _peerManager?.resetWebRTC();
-    await _peerManager?.startAsOfferer();
-    _reconnecting = false;
-  }
-
-  /// Chamado quando o peer remoto sai da room.
-  /// Ambos os papéis: reseta WebRTC.
-  /// Admin: volta para modo answerer aguardando nova offer.
-  /// Member: apenas aguarda o próximo peer_joined para re-iniciar.
-  Future<void> _onPeerLeft() async {
-    debugPrint('[Chat] peer_left — resetting WebRTC');
-    _reconnecting = true;
-    _handlerMsgSub?.cancel();
-    _handler?.dispose();
-    _handler = null;
-    _syncManager = null;
-    await _peerManager?.resetWebRTC();
-    if (_isAdmin == true) {
-      await _peerManager?.startAsAnswerer();
+    if (isOfferer) {
+      await pcm.startAsOfferer();
+    } else {
+      await pcm.startAsAnswerer();
     }
-    _reconnecting = false;
   }
 
-  // ─── DataChannel aberto: inicia Signal Protocol + SyncManager ────────────
+  /// Remove e descarta todos os recursos associados ao peer [remotePK].
+  Future<void> _disposePeer(String remotePK) async {
+    _handlerMsgSubs[remotePK]?.cancel();
+    _handlerMsgSubs.remove(remotePK);
+    _indicatorSubs[remotePK]?.cancel();
+    _indicatorSubs.remove(remotePK);
+    _indicatorStates.remove(remotePK);
+    _handlers[remotePK]?.dispose();
+    _handlers.remove(remotePK);
+    _syncManagers.remove(remotePK);
+    await _peerManagers[remotePK]?.dispose();
+    _peerManagers.remove(remotePK);
+  }
 
-  Future<void> _onDataChannelReady(RTCDataChannel ch) async {
-    _hadSuccessfulConnection = true;
-    debugPrint('[Chat] DataChannel OPEN — initializing Signal Protocol');
-    try {
-      // Early buffer: sobrescreve ch.onMessage imediatamente (sem await) para capturar
-      // mensagens que chegam durante o init do Signal Protocol (ex: SESSION_HELLO do member).
-      // Sem isso, essas mensagens vão para _messageController → _msgSub → _onRawMessage,
-      // avançando o ratchet do member sem que o admin processe → descriptografia quebrada.
-      final earlyBuffer = <RTCDataChannelMessage>[];
-      ch.onMessage = earlyBuffer.add;
+  void _updateIndicator() {
+    if (!mounted) return;
+    ConnectionIndicator best = ConnectionIndicator.offline;
+    for (final s in _indicatorStates.values) {
+      if (s == ConnectionIndicator.p2pDirect) {
+        best = ConnectionIndicator.p2pDirect;
+        break;
+      } else if (s == ConnectionIndicator.turnRelay) {
+        best = ConnectionIndicator.turnRelay;
+      }
+    }
+    setState(() => _indicator = best);
+  }
 
-      final channelRepo = ChannelRepository(widget.db);
-      final localMember = await channelRepo.getMember(widget.channel.id, widget.currentUser.id);
-      final allMembers = await channelRepo.getMembers(widget.channel.id);
+  // ─── DataChannel aberto: troca MEMBER_INFO + inicia Signal Protocol ──────
 
-      // Seleciona papel Signal
-      final session = SignalSession(peerId: widget.channel.id);
-      if (localMember?.role == MemberRole.admin) {
-        // Admin (criador): aguarda o PreKeySignalMessage do joiner para completar X3DH.
-        debugPrint('[Chat] Signal role=ADMIN — calling session.receive()');
-        await session.receive();
+  Future<void> _onDataChannelReady(RTCDataChannel ch, String remotePK) async {
+    debugPrint('[Chat] DataChannel OPEN for peer=${remotePK.substring(0, 8)}…');
+
+    // Early buffer: captura todas as mensagens que chegam antes do handler estar pronto.
+    // Binárias = Signal ciphertext. Texto = MEMBER_INFO ou controle (SYNC_*).
+    final earlyBinaryBuffer = <RTCDataChannelMessage>[];
+    final earlyTextBuffer   = <RTCDataChannelMessage>[];
+    final memberInfoCompleter = Completer<Map<String, dynamic>?>();
+
+    ch.onMessage = (raw) {
+      if (!raw.isBinary) {
+        try {
+          final json = jsonDecode(raw.text) as Map<String, dynamic>;
+          if (json['type'] == 'MEMBER_INFO' && !memberInfoCompleter.isCompleted) {
+            memberInfoCompleter.complete(json);
+            return;
+          }
+        } catch (_) {}
+        earlyTextBuffer.add(raw);
       } else {
-        // Member (joiner): inicia X3DH com as chaves do criador.
-        final peerMember = allMembers.firstWhere(
-          (m) => m.userId != widget.currentUser.id,
-          orElse: () => allMembers.first,
-        );
-        debugPrint('[Chat] Signal role=MEMBER — peer signalKey=${peerMember.signalKey != null} sig=${peerMember.signalPreKeySig != null}');
-        if (peerMember.signalKey != null &&
-            peerMember.signalPreKey != null &&
-            peerMember.signalPreKeySig != null) {
-          final peerBundle = await SignalSession.buildPeerBundle(
-            peerMember.signalKey!,
-            peerMember.signalPreKey!,
-            peerMember.signalPreKeySig!,
-          );
-          await session.initiate(peerBundle);
-          debugPrint('[Chat] Signal X3DH initiated ✓');
-        } else {
-          // Sem chaves Signal no QrPayload — canal criado com keyring antigo
-          debugPrint('[Chat] Signal keys absent — raw bytes fallback (reset with RESET_ON_START=true)');
+        earlyBinaryBuffer.add(raw);
+      }
+    };
+
+    // Envia MEMBER_INFO imediatamente (pré-Signal, protegido por DTLS).
+    // Resolve Bug 1 (detalhes do canal) e bootstrapa Signal para pares não-admin (Bug 2).
+    await _sendMemberInfo(ch);
+
+    // Aguarda MEMBER_INFO do peer remoto (máximo 5s).
+    Map<String, dynamic>? remoteMemberInfo;
+    try {
+      remoteMemberInfo = await memberInfoCompleter.future.timeout(const Duration(seconds: 5));
+      debugPrint('[Chat] MEMBER_INFO received from peer=${remotePK.substring(0, 8)}…');
+    } catch (_) {
+      debugPrint('[Chat] MEMBER_INFO timeout for peer=${remotePK.substring(0, 8)}… — continuing');
+    }
+
+    if (remoteMemberInfo != null) await _saveRemoteMemberInfo(remoteMemberInfo);
+
+    final pcm = _peerManagers[remotePK];
+    if (pcm == null || !mounted) return;
+
+    try {
+      final session = SignalSession(peerId: remotePK);
+
+      if (pcm.isOfferer) {
+        // Offerer = X3DH initiator: constrói a bundle com as chaves Signal do peer.
+        // Prioridade: MEMBER_INFO (mais fresco) → DB (join via QR anterior).
+        final bundle = await _buildPeerBundle(remoteMemberInfo, remotePK);
+        if (bundle == null) {
+          debugPrint('[Chat] Signal keys absent for peer=${remotePK.substring(0, 8)}… — skipping Signal');
           return;
         }
+        await session.initiate(bundle);
+        debugPrint('[Chat] Signal X3DH initiated with peer=${remotePK.substring(0, 8)}…');
+      } else {
+        // Answerer = X3DH responder: aguarda o PreKeySignalMessage do offerer.
+        await session.receive();
+        debugPrint('[Chat] Signal session.receive() ready for peer=${remotePK.substring(0, 8)}…');
       }
 
-      // Cria o handler e substitui o stream raw
-      _handler = DataChannelHandler(
+      final handler = DataChannelHandler(
         dataChannel: ch,
         session: session,
         messageRepo: _repo,
         localUserId: widget.currentUser.id,
         channelId: widget.channel.id,
       );
+      _handlers[remotePK] = handler;
 
-      // P2-A: SyncManager ao conectar (SPEC-SYNC-001)
-      _syncManager = SyncManager(
+      final syncManager = SyncManager(
         dataChannel: ch,
         messageRepo: _repo,
         channelId: widget.channel.id,
         localUserId: widget.currentUser.id,
         localClock: VectorClock({widget.currentUser.id: 0}),
+        onMessagesReceived: _loadHistory,
       );
-      _handler!.onControlMessage = (msg) => _syncManager?.handleControlMessage(msg);
-      _handler!.onSessionReady = () {
+      _syncManagers[remotePK] = syncManager;
+
+      handler.onControlMessage = (msg) => syncManager.handleControlMessage(msg);
+      handler.onSessionReady = () {
         if (mounted) _retrySendPending();
       };
 
-      _handlerMsgSub = _handler!.onMessage.listen((msg) {
-        debugPrint('[Chat] received message via Signal ✓');
-        if (mounted) setState(() => _messages.add(msg));
+      _handlerMsgSubs[remotePK] = handler.onMessage.listen((msg) {
+        if (!mounted) return;
+        setState(() {
+          // Deduplicação por UUID na UI (SPEC-SYNC-002).
+          if (!_messages.any((m) => m.id == msg.id)) _messages.add(msg);
+        });
         _scrollToBottom();
+        if (!_appInForeground) {
+          final preview = msg.payload.length > 40
+              ? String.fromCharCodes(msg.payload.take(40))
+              : String.fromCharCodes(msg.payload);
+          NotificationService.notifyNewMessage(widget.channel.name, preview);
+        }
       });
 
-      // Replay: processa mensagens que chegaram antes de _handler estar pronto.
-      for (final msg in earlyBuffer) {
-        await _handler!.processRawMessage(msg);
+      // Replay mensagens bufferizadas antes do handler estar pronto.
+      for (final raw in earlyBinaryBuffer) {
+        await handler.processRawMessage(raw);
+      }
+      for (final raw in earlyTextBuffer) {
+        await handler.processRawMessage(raw);
       }
 
-      // Member envia SESSION_HELLO para completar o X3DH no lado do admin.
-      // O early buffer garante que a mensagem chega em _handleIncoming mesmo que
-      // o admin ainda esteja inicializando.
-      if (_isAdmin != true) {
-        await _handler!.sendSessionHello();
-      }
+      // Offerer envia SESSION_HELLO para completar o X3DH no lado do answerer.
+      if (pcm.isOfferer) await handler.sendSessionHello();
 
-      await _syncManager!.startSync();
-      debugPrint('[Chat] SyncManager started ✓');
-
-      // P2-B: reenviar mensagens pending ao conectar
+      await syncManager.startSync();
+      debugPrint('[Chat] SyncManager started for peer=${remotePK.substring(0, 8)}…');
       await _retrySendPending();
-      debugPrint('[Chat] DataChannel ready — Signal Protocol active');
     } catch (e, stack) {
-      debugPrint('[Chat] Signal init failed: $e\n$stack — falling back to raw bytes');
+      debugPrint('[Chat] Signal init failed for peer=${remotePK.substring(0, 8)}…: $e\n$stack');
     }
   }
 
-  // ─── Mensagem raw (antes do Signal inicializar) ───────────────────────────
+  /// Constrói a PreKeyBundle do peer remoto.
+  /// Prioridade: dados frescos do [remoteMemberInfo] → fallback para DB.
+  Future<dynamic> _buildPeerBundle(Map<String, dynamic>? remoteMemberInfo, String remotePK) async {
+    // 1. Dados do MEMBER_INFO (mais recente).
+    if (remoteMemberInfo != null &&
+        remoteMemberInfo['signalKey'] != null &&
+        remoteMemberInfo['signalPreKey'] != null &&
+        remoteMemberInfo['signalPreKeySig'] != null) {
+      return SignalSession.buildPeerBundle(
+        base64Decode(remoteMemberInfo['signalKey'] as String),
+        base64Decode(remoteMemberInfo['signalPreKey'] as String),
+        base64Decode(remoteMemberInfo['signalPreKeySig'] as String),
+      );
+    }
 
-  Future<void> _onRawMessage(Uint8List payload) async {
-    final msg = Message(
-      id: '${DateTime.now().millisecondsSinceEpoch}_rx',
-      channelId: widget.channel.id,
-      senderId: 'peer-${widget.channel.id}',
-      type: MessageType.text,
-      payload: payload,
-      timestamp: DateTime.now(),
-      vectorClock: {},
-      signature: Uint8List(0),
-      status: MessageStatus.delivered,
+    // 2. Fallback: chaves guardadas no DB ao ingressar via QR/invite.
+    final allMembers = await ChannelRepository(widget.db).getMembers(widget.channel.id);
+    final peerMember = allMembers.firstWhereOrNull(
+      (m) => m.userId != widget.currentUser.id,
     );
-    await _repo.save(msg);
-    if (mounted) setState(() => _messages.add(msg));
-    _scrollToBottom();
+    if (peerMember?.signalKey != null &&
+        peerMember?.signalPreKey != null &&
+        peerMember?.signalPreKeySig != null) {
+      return SignalSession.buildPeerBundle(
+        peerMember!.signalKey!,
+        peerMember.signalPreKey!,
+        peerMember.signalPreKeySig!,
+      );
+    }
+
+    return null;
   }
 
-  // P2-B: reenviar mensagens pending quando DataChannel abre ou X3DH completa.
+  // ─── Troca de MEMBER_INFO ─────────────────────────────────────────────────
+
+  /// Envia as informações do peer local via DataChannel (pré-Signal, protegido por DTLS).
+  Future<void> _sendMemberInfo(RTCDataChannel ch) async {
+    try {
+      final localMember = await ChannelRepository(widget.db)
+          .getMember(widget.channel.id, widget.currentUser.id);
+      final signalKeys = await SignalSession.getLocalSignalKeys();
+
+      final info = jsonEncode({
+        'type': 'MEMBER_INFO',
+        'userId': widget.currentUser.id,
+        'displayName': widget.currentUser.displayName,
+        'publicKey': base64Encode(widget.currentUser.identityPublicKey),
+        'signalKey': base64Encode(signalKeys['signalKey']!),
+        'signalPreKey': base64Encode(signalKeys['signalPreKey']!),
+        'signalPreKeySig': base64Encode(signalKeys['signalPreKeySig']!),
+        'role': localMember?.role.name ?? 'member',
+        'channelId': widget.channel.id,
+      });
+      ch.send(RTCDataChannelMessage(info));
+      debugPrint('[Chat] MEMBER_INFO sent');
+    } catch (e) {
+      debugPrint('[Chat] sendMemberInfo failed: $e');
+    }
+  }
+
+  /// Persiste as informações do peer remoto em channel_members (upsert).
+  /// Remove o placeholder 'peer-<channelId>' salvo no join via QR para evitar duplicatas.
+  Future<void> _saveRemoteMemberInfo(Map<String, dynamic> info) async {
+    try {
+      final userId = info['userId'] as String;
+      final publicKey = base64Decode(info['publicKey'] as String);
+      final displayName = info['displayName'] as String? ?? '';
+      final repo = ChannelRepository(widget.db);
+
+      // Remove registro placeholder (userId sintético) com a mesma chave pública.
+      await repo.deleteMemberByPublicKey(
+        widget.channel.id,
+        publicKey,
+        exceptUserId: userId,
+      );
+
+      final member = ChannelMember(
+        channelId: widget.channel.id,
+        userId: userId,
+        displayName: displayName,
+        publicKey: publicKey,
+        role: info['role'] == 'admin' ? MemberRole.admin : MemberRole.member,
+        joinedAt: DateTime.now(),
+        vectorClock: {},
+        signalKey: info['signalKey'] != null
+            ? base64Decode(info['signalKey'] as String) : null,
+        signalPreKey: info['signalPreKey'] != null
+            ? base64Decode(info['signalPreKey'] as String) : null,
+        signalPreKeySig: info['signalPreKeySig'] != null
+            ? base64Decode(info['signalPreKeySig'] as String) : null,
+      );
+      await repo.saveMember(member);
+
+      if (displayName.isNotEmpty && mounted) {
+        setState(() => _memberNames[userId] = displayName);
+      }
+      debugPrint('[Chat] MEMBER_INFO saved — userId=$userId displayName=$displayName');
+    } catch (e) {
+      debugPrint('[Chat] saveRemoteMemberInfo failed: $e');
+    }
+  }
+
+  // ─── Reenvio de pending + retry ──────────────────────────────────────────
+
   Future<void> _retrySendPending() async {
-    if (_handler == null) return;
+    if (_handlers.isEmpty) return;
     final pending = (await _repo.getPending())
         .where((m) => m.channelId == widget.channel.id)
         .toList();
     for (final msg in pending) {
-      final sent = await _handler!.send(msg);
-      if (sent) await _repo.updateStatus(msg.id, MessageStatus.sent);
+      bool anySent = false;
+      for (final handler in _handlers.values) {
+        if (await handler.send(msg)) anySent = true;
+      }
+      if (anySent) await _repo.updateStatus(msg.id, MessageStatus.sent);
     }
     await _loadHistory();
   }
@@ -401,6 +513,19 @@ class _ChatScreenState extends State<ChatScreen> {
         title: Text(widget.channel.name, style: const TextStyle(color: AppColors.onSurface)),
         iconTheme: const IconThemeData(color: AppColors.onSurface),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.info_outline, color: AppColors.onSurface),
+            tooltip: 'Detalhes do canal',
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute(
+                builder: (_) => ChannelDetailsScreen(
+                  db: widget.db,
+                  currentUser: widget.currentUser,
+                  channel: widget.channel,
+                ),
+              ),
+            ),
+          ),
           Padding(
             padding: const EdgeInsets.only(right: 12),
             child: ConnectionIndicatorWidget(state: _indicator),
@@ -409,7 +534,6 @@ class _ChatScreenState extends State<ChatScreen> {
       ),
       body: Column(
         children: [
-          // Banner de erro quando as chaves do keyring não são encontradas.
           if (_connectionError != null)
             Container(
               width: double.infinity,
@@ -449,6 +573,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Widget _bubble(Message msg) {
     final isMe = msg.senderId == widget.currentUser.id;
+    final senderName = isMe ? '' : (_memberNames[msg.senderId] ?? '');
     return Align(
       alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
       child: Container(
@@ -463,25 +588,40 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
         ),
         child: Column(
-          crossAxisAlignment: CrossAxisAlignment.end,
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            if (!isMe && senderName.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 4),
+                child: Text(
+                  senderName,
+                  style: const TextStyle(
+                    color: AppColors.primary,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
             Text(
               utf8.decode(msg.payload, allowMalformed: true),
               style: const TextStyle(color: AppColors.onSurface, fontSize: 15),
             ),
             const SizedBox(height: 4),
-            Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  _time(msg.timestamp),
-                  style: TextStyle(color: AppColors.subtle, fontSize: 11),
-                ),
-                if (isMe) ...[
-                  const SizedBox(width: 4),
-                  MessageStatusIcon(status: msg.status),
+            Align(
+              alignment: Alignment.centerRight,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    _time(msg.timestamp),
+                    style: TextStyle(color: AppColors.subtle, fontSize: 11),
+                  ),
+                  if (isMe) ...[
+                    const SizedBox(width: 4),
+                    MessageStatusIcon(status: msg.status),
+                  ],
                 ],
-              ],
+              ),
             ),
           ],
         ),
@@ -489,34 +629,39 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
-  Widget _composer() => Container(
-        color: AppColors.surface,
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-        child: Row(
-          children: [
-            Expanded(
-              child: TextField(
-                controller: _textCtrl,
-                style: const TextStyle(color: AppColors.onSurface),
-                decoration: InputDecoration(
-                  hintText: 'Mensagem',
-                  hintStyle: TextStyle(color: AppColors.subtle),
-                  filled: true,
-                  fillColor: AppColors.background,
-                  contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(24),
-                    borderSide: BorderSide.none,
+  Widget _composer() => SafeArea(
+        top: false,
+        child: Container(
+          color: AppColors.surface,
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          child: Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _textCtrl,
+                  style: const TextStyle(color: AppColors.onSurface),
+                  textInputAction: TextInputAction.send,
+                  onSubmitted: (_) => _sendText(),
+                  decoration: InputDecoration(
+                    hintText: 'Mensagem',
+                    hintStyle: TextStyle(color: AppColors.subtle),
+                    filled: true,
+                    fillColor: AppColors.background,
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(24),
+                      borderSide: BorderSide.none,
+                    ),
                   ),
                 ),
               ),
-            ),
-            const SizedBox(width: 8),
-            IconButton(
-              onPressed: _sendText,
-              icon: const Icon(Icons.send_rounded, color: AppColors.primary),
-            ),
-          ],
+              const SizedBox(width: 8),
+              IconButton(
+                onPressed: _sendText,
+                icon: const Icon(Icons.send_rounded, color: AppColors.primary),
+              ),
+            ],
+          ),
         ),
       );
 
@@ -527,7 +672,7 @@ class _ChatScreenState extends State<ChatScreen> {
     if (text.isEmpty) return;
     _textCtrl.clear();
 
-    final connected = _peerManager?.isConnected == true;
+    final connected = _handlers.isNotEmpty;
     final msg = Message(
       id: DateTime.now().millisecondsSinceEpoch.toString(),
       channelId: widget.channel.id,
@@ -544,26 +689,20 @@ class _ChatScreenState extends State<ChatScreen> {
     if (mounted) setState(() => _messages.add(msg));
 
     if (connected) {
-      if (_handler != null) {
-        // Pipeline completo: Signal encrypt + Ed25519 sign (SPEC-CRYPTO-002 + SPEC-MSG-001).
-        // Se sessionReady=false (X3DH incompleto no admin), send() retorna false e a mensagem
-        // fica pending — onSessionReady dispara _retrySendPending quando o X3DH completar.
-        final sent = await _handler!.send(msg);
-        if (!sent) {
-          await _repo.updateStatus(msg.id, MessageStatus.pending);
-          if (mounted) {
-            setState(() {
-              final idx = _messages.indexWhere((m) => m.id == msg.id);
-              if (idx != -1) _messages[idx] = msg.copyWith(status: MessageStatus.pending);
-            });
-          }
+      bool anySent = false;
+      for (final handler in _handlers.values) {
+        if (await handler.send(msg)) anySent = true;
+      }
+      if (!anySent) {
+        await _repo.updateStatus(msg.id, MessageStatus.pending);
+        if (mounted) {
+          setState(() {
+            final idx = _messages.indexWhere((m) => m.id == msg.id);
+            if (idx != -1) _messages[idx] = msg.copyWith(status: MessageStatus.pending);
+          });
         }
-      } else {
-        // Fallback raw enquanto Signal Protocol não estiver inicializado
-        _peerManager!.sendBytes(Uint8List.fromList(utf8.encode(text)));
       }
     }
-
     _scrollToBottom();
   }
 
@@ -586,22 +725,35 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   void dispose() {
-    _reconnectTimer?.cancel();
-    _indicatorSub?.cancel();
-    _msgSub?.cancel();
-    _handlerMsgSub?.cancel();
-    _handler?.dispose();
-
-    // Envia leave e fecha o WebSocket — evita que o cleanup do servidor derrube
-    // um peer recém-reconectado que entrou na mesma room com a mesma pubkey.
+    WidgetsBinding.instance.removeObserver(this);
+    _globalSignalingSub?.cancel();
+    for (final sub in _indicatorSubs.values) {
+      sub.cancel();
+    }
+    for (final sub in _handlerMsgSubs.values) {
+      sub.cancel();
+    }
+    for (final handler in _handlers.values) {
+      handler.dispose();
+    }
     if (_signalingClient != null && _pubKeyB64 != null) {
       _signalingClient!.leave(widget.channel.id, _pubKeyB64!);
     }
     _signalingClient?.close();
-
-    _peerManager?.dispose();
+    for (final pcm in _peerManagers.values) {
+      pcm.dispose();
+    }
     _textCtrl.dispose();
     _scrollCtrl.dispose();
     super.dispose();
+  }
+}
+
+extension _FirstOrNull<T> on List<T> {
+  T? firstWhereOrNull(bool Function(T) test) {
+    for (final e in this) {
+      if (test(e)) return e;
+    }
+    return null;
   }
 }

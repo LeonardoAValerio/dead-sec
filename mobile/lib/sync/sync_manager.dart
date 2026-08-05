@@ -27,6 +27,8 @@ class SyncManager {
   final String channelId;
   final String localUserId;
   final VectorClock localClock;
+  // Chamado após salvar mensagens recebidas via SYNC_RESPONSE, para que a UI atualize.
+  final void Function()? onMessagesReceived;
 
   SyncManager({
     required this.dataChannel,
@@ -34,6 +36,7 @@ class SyncManager {
     required this.channelId,
     required this.localUserId,
     required this.localClock,
+    this.onMessagesReceived,
   });
 
   /// Inicia o handshake enviando o Vector Clock local ao peer.
@@ -86,6 +89,8 @@ class SyncManager {
     }
 
     _send({'type': _kSyncAck, 'channel_id': channelId, 'ids': receivedIds});
+
+    if (receivedIds.isNotEmpty) onMessagesReceived?.call();
 
     // Após receber delta do peer, envia as próprias mensagens pendentes
     await startSync();

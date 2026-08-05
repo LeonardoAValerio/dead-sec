@@ -12,11 +12,12 @@ import (
 )
 
 // SignalMessage é a única estrutura de dados que trafega pelo servidor.
-// O servidor lê `type`, `room` e `from` para rotear — nunca inspeciona `data`.
+// O servidor lê `type`, `room`, `from` e `to` para rotear — nunca inspeciona `data`.
 type SignalMessage struct {
 	Type string          `json:"type"`
 	Room string          `json:"room"`
 	From string          `json:"from"`
+	To   string          `json:"to,omitempty"` // destino específico para offer/answer/ice-candidate
 	Data json.RawMessage `json:"data,omitempty"`
 }
 
@@ -75,8 +76,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		switch msg.Type {
 		case "join":
 			h.hub.Join(msg.Room, p)
+			// Notifica o novo peer sobre quem já está na sala (room_peers).
+			existingPeers := h.hub.GetPeers(msg.Room, pubKey)
 			roomSize := h.hub.roomSize(msg.Room)
-			log.Printf("[HUB] join  pk=%s room=%s peers_in_room=%d", shortKey, shortRoom(msg.Room), roomSize)
+			log.Printf("[HUB] join  pk=%s room=%s peers_in_room=%d existing=%d", shortKey, shortRoom(msg.Room), roomSize, len(existingPeers))
+			if len(existingPeers) > 0 {
+				peersData, _ := json.Marshal(map[string]interface{}{"peers": existingPeers})
+				roomPeersMsg, _ := json.Marshal(SignalMessage{
+					Type: "room_peers",
+					Room: msg.Room,
+					From: "server",
+					Data: json.RawMessage(peersData),
+				})
+				if err := conn.Write(ctx, websocket.MessageText, roomPeersMsg); err != nil {
+					log.Printf("[WS] room_peers error pk=%s: %v", shortKey, err)
+				}
+			}
 		case "leave":
 			h.hub.Leave(msg.Room, pubKey)
 			log.Printf("[HUB] leave pk=%s room=%s", shortKey, shortRoom(msg.Room))
@@ -85,8 +100,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				continue
 			}
-			n := h.hub.Broadcast(msg.Room, pubKey, out)
-			log.Printf("[HUB] %-13s from=%s room=%s delivered_to=%d", msg.Type, shortKey, shortRoom(msg.Room), n)
+			var n int
+			if msg.To != "" {
+				// Roteamento direto para peer específico (mesh topology).
+				if h.hub.SendTo(msg.Room, msg.To, out) {
+					n = 1
+				}
+			} else {
+				// Broadcast para compatibilidade com clientes sem campo `to`.
+				n = h.hub.Broadcast(msg.Room, pubKey, out)
+			}
+			log.Printf("[HUB] %-13s from=%s to=%s room=%s delivered_to=%d", msg.Type, shortKey, shortPK(msg.To), shortRoom(msg.Room), n)
 		}
 	}
 

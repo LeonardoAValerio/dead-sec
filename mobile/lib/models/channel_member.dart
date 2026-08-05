@@ -6,6 +6,7 @@ enum MemberRole { admin, member }
 class ChannelMember {
   final String channelId;
   final String userId;
+  final String displayName;
   final Uint8List publicKey;
   final MemberRole role;
   final DateTime joinedAt;
@@ -18,6 +19,7 @@ class ChannelMember {
   const ChannelMember({
     required this.channelId,
     required this.userId,
+    this.displayName = '',
     required this.publicKey,
     required this.role,
     required this.joinedAt,
@@ -30,6 +32,7 @@ class ChannelMember {
   Map<String, dynamic> toMap() => {
         'channel_id': channelId,
         'user_id': userId,
+        'display_name': displayName,
         'public_key': publicKey,
         'role': role.name,
         'joined_at': joinedAt.millisecondsSinceEpoch,
@@ -42,6 +45,7 @@ class ChannelMember {
   factory ChannelMember.fromMap(Map<String, dynamic> m) => ChannelMember(
         channelId: m['channel_id'] as String,
         userId: m['user_id'] as String,
+        displayName: m['display_name'] as String? ?? '',
         publicKey: m['public_key'] as Uint8List,
         role: m['role'] == 'admin' ? MemberRole.admin : MemberRole.member,
         joinedAt: DateTime.fromMillisecondsSinceEpoch(m['joined_at'] as int),

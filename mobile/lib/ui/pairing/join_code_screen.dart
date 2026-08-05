@@ -121,6 +121,11 @@ class _JoinCodeScreenState extends State<JoinCodeScreen> {
       setState(() => _error = 'Cole o código de convite antes de continuar.');
       return;
     }
+    final pass = _passCtrl.text;
+    if (pass.isNotEmpty && pass.length < 8) {
+      setState(() => _error = 'A senha deve ter pelo menos 8 caracteres.');
+      return;
+    }
 
     setState(() {
       _loading = true;

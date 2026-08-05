@@ -51,6 +51,8 @@ dependencies:
   http: ^1.6.0
   fixnum: ^1.1.1
   path: ^1.9.1
+  flutter_local_notifications: ^18.0.0
+  shared_preferences: ^2.3.0
 
 dev_dependencies:
   flutter_test:
