@@ -135,6 +135,27 @@ class SignalSession {
     );
   }
 
+  /// Retorna as chaves Signal públicas do peer local para compartilhar via MEMBER_INFO.
+  /// Inclui signalKey (X25519 identity), signalPreKey (X25519 signed pre-key) e
+  /// signalPreKeySig (assinatura Ed25519 da pre-key) — necessários para X3DH.
+  static Future<Map<String, Uint8List>> getLocalSignalKeys() async {
+    final signalIdPair = await KeyManager.loadSignalIdentityKeyPair();
+    final signalIdPrivBytes = Uint8List.fromList(await signalIdPair.extractPrivateKeyBytes());
+    final signalIdPubBytes = Uint8List.fromList((await signalIdPair.extractPublicKey()).bytes);
+
+    final preKeyPair = await KeyManager.loadSignedPreKeyPair();
+    final preKeyPubBytes = Uint8List.fromList((await preKeyPair.extractPublicKey()).bytes);
+
+    final ecSignalIdPriv = Curve.decodePrivatePoint(signalIdPrivBytes);
+    final preKeySig = Curve.calculateSignature(ecSignalIdPriv, _prefixed(preKeyPubBytes));
+
+    return {
+      'signalKey': signalIdPubBytes,
+      'signalPreKey': preKeyPubBytes,
+      'signalPreKeySig': Uint8List.fromList(preKeySig),
+    };
+  }
+
   /// Constrói a PreKeyBundle do peer remoto a partir das chaves recebidas via QR/invite code.
   /// Usado pelo joiner (member) para iniciar a sessão X3DH com o criador do canal.
   static Future<PreKeyBundle> buildPeerBundle(

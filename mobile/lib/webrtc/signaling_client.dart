@@ -3,18 +3,30 @@ import 'dart:convert';
 
 import 'package:web_socket_channel/web_socket_channel.dart';
 
-enum SignalingMessageType { offer, answer, iceCandidate, join, leave, peerJoined, peerLeft, unknown }
+enum SignalingMessageType {
+  offer,
+  answer,
+  iceCandidate,
+  join,
+  leave,
+  peerJoined,
+  peerLeft,
+  roomPeers,
+  unknown,
+}
 
 class SignalingMessage {
   final SignalingMessageType type;
   final String room;
   final String from;
+  final String? to;
   final Map<String, dynamic> data;
 
   const SignalingMessage({
     required this.type,
     required this.room,
     required this.from,
+    this.to,
     required this.data,
   });
 
@@ -28,12 +40,14 @@ class SignalingMessage {
       'leave' => SignalingMessageType.leave,
       'peer_joined' => SignalingMessageType.peerJoined,
       'peer_left' => SignalingMessageType.peerLeft,
+      'room_peers' => SignalingMessageType.roomPeers,
       _ => SignalingMessageType.unknown,
     };
     return SignalingMessage(
       type: type,
       room: json['room'] as String? ?? '',
       from: json['from'] as String? ?? '',
+      to: json['to'] as String?,
       data: Map<String, dynamic>.from(json['data'] as Map? ?? {}),
     );
   }
@@ -71,9 +85,11 @@ class SignalingClient {
     await _channel!.ready;
   }
 
-  void send(String type, String room, String from, Map<String, dynamic> data) {
-    final msg = jsonEncode({'type': type, 'room': room, 'from': from, 'data': data});
-    _channel?.sink.add(msg);
+  /// Envia uma mensagem de sinalização. Use [to] para roteamento direto peer-a-peer.
+  void send(String type, String room, String from, Map<String, dynamic> data, {String? to}) {
+    final msg = <String, dynamic>{'type': type, 'room': room, 'from': from, 'data': data};
+    if (to != null) msg['to'] = to;
+    _channel?.sink.add(jsonEncode(msg));
   }
 
   void join(String room, String pubKey) => send('join', room, pubKey, {});

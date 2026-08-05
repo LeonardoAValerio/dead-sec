@@ -139,6 +139,36 @@ class PairingService {
     return (channel: channel, qr: qr);
   }
 
+  /// Gera um QR payload para um canal já existente (expira em 5 min).
+  /// Não cria canal nem grava no banco — apenas monta o payload com as chaves locais.
+  Future<QrPayload> generateInviteQr(Channel channel) async {
+    final identityPair = await KeyManager.loadIdentityKeyPair();
+    final preKeyPair = await KeyManager.loadSignedPreKeyPair();
+
+    final pubKeyBytes = Uint8List.fromList((await identityPair.extractPublicKey()).bytes);
+    final preKeyBytes = Uint8List.fromList((await preKeyPair.extractPublicKey()).bytes);
+
+    Uint8List? signalIdPubBytes;
+    Uint8List? preKeySig;
+    try {
+      final signalIdPair = await KeyManager.loadSignalIdentityKeyPair();
+      signalIdPubBytes = Uint8List.fromList((await signalIdPair.extractPublicKey()).bytes);
+      final signalIdPrivBytes = Uint8List.fromList(await signalIdPair.extractPrivateKeyBytes());
+      final ecSignalIdPriv = Curve.decodePrivatePoint(signalIdPrivBytes);
+      preKeySig = Curve.calculateSignature(ecSignalIdPriv, _prefixed(preKeyBytes));
+    } catch (_) {}
+
+    return QrPayload(
+      channelId: channel.id,
+      channelName: channel.name,
+      creatorPublicKey: pubKeyBytes,
+      signedPreKey: preKeyBytes,
+      expiresAt: DateTime.now().add(const Duration(minutes: 5)).millisecondsSinceEpoch,
+      signalIdentityKey: signalIdPubBytes,
+      preKeySignature: preKeySig,
+    );
+  }
+
   /// Cria um canal e gera um código de convite de texto (opcionalmente protegido por senha).
   Future<({Channel channel, String inviteCode})> createChannelWithCode(
     String name,

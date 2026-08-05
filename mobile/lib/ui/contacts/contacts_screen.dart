@@ -11,7 +11,9 @@ import '../../models/user.dart';
 import '../chat/chat_screen.dart';
 import '../pairing/create_channel_screen.dart';
 import '../pairing/join_code_screen.dart';
+import '../pairing/qr_generate_screen.dart';
 import '../pairing/qr_scan_screen.dart';
+import '../settings/settings_screen.dart';
 
 /// Lista de canais (conversas) do usuário.
 class ContactsScreen extends StatefulWidget {
@@ -53,7 +55,11 @@ class _ContactsScreenState extends State<ContactsScreen> {
         actions: [
           IconButton(
             icon: const Icon(Icons.settings_outlined, color: AppColors.onSurface),
-            onPressed: () {},
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute(
+                builder: (_) => SettingsScreen(db: widget.db, currentUser: widget.currentUser),
+              ),
+            ),
           ),
         ],
       ),
@@ -108,9 +114,39 @@ class _ContactsScreenState extends State<ContactsScreen> {
                 ),
               ),
             ),
+            onLongPress: () => _confirmDeleteChannel(ch),
           );
         },
       );
+
+  void _confirmDeleteChannel(Channel ch) {
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: AppColors.surface,
+        title: const Text('Excluir canal?', style: TextStyle(color: AppColors.onSurface)),
+        content: Text(
+          'O canal "${ch.name}" e todas as suas mensagens serão removidos permanentemente.',
+          style: const TextStyle(color: AppColors.subtle),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Cancelar', style: TextStyle(color: AppColors.subtle)),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: Colors.redAccent),
+            onPressed: () async {
+              Navigator.of(ctx).pop();
+              await _repo.deleteChannel(ch.id);
+              _loadChannels();
+            },
+            child: const Text('Excluir'),
+          ),
+        ],
+      ),
+    );
+  }
 
   void _showAddMenu(BuildContext context) {
     showModalBottomSheet<void>(
@@ -135,6 +171,34 @@ class _ContactsScreenState extends State<ContactsScreen> {
                 Navigator.of(context).pop();
                 _openCreateChannel();
               },
+            ),
+            ListTile(
+              enabled: !_isDesktop,
+              leading: Icon(
+                Icons.qr_code_2,
+                color: _isDesktop ? AppColors.subtle : AppColors.primary,
+              ),
+              title: Text(
+                'Criar canal via QR Code',
+                style: TextStyle(
+                  color: _isDesktop ? AppColors.subtle : AppColors.onSurface,
+                ),
+              ),
+              subtitle: _isDesktop
+                  ? const Text(
+                      'Não disponível no desktop',
+                      style: TextStyle(color: AppColors.subtle, fontSize: 12),
+                    )
+                  : const Text(
+                      'Gera um QR Code para o peer escanear',
+                      style: TextStyle(color: AppColors.subtle, fontSize: 12),
+                    ),
+              onTap: _isDesktop
+                  ? null
+                  : () {
+                      Navigator.of(context).pop();
+                      _openCreateQr();
+                    },
             ),
             ListTile(
               leading: const Icon(Icons.content_paste_outlined, color: AppColors.primary),
@@ -191,6 +255,57 @@ class _ContactsScreenState extends State<ContactsScreen> {
         ),
       ),
     );
+  }
+
+  Future<void> _openCreateQr() async {
+    final nameCtrl = TextEditingController();
+    final name = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: AppColors.surface,
+        title: const Text('Nome do canal', style: TextStyle(color: AppColors.onSurface)),
+        content: TextField(
+          controller: nameCtrl,
+          autofocus: true,
+          style: const TextStyle(color: AppColors.onSurface),
+          decoration: InputDecoration(
+            hintText: 'Ex: Amigos, Projeto...',
+            hintStyle: const TextStyle(color: AppColors.subtle),
+            filled: true,
+            fillColor: AppColors.background,
+            border: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(12),
+              borderSide: BorderSide.none,
+            ),
+          ),
+          onSubmitted: (v) => Navigator.of(ctx).pop(v.trim()),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Cancelar', style: TextStyle(color: AppColors.subtle)),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: AppColors.primary),
+            onPressed: () => Navigator.of(ctx).pop(nameCtrl.text.trim()),
+            child: const Text('Criar'),
+          ),
+        ],
+      ),
+    );
+
+    if (name == null || name.isEmpty || !mounted) return;
+
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => QrGenerateScreen(
+          db: widget.db,
+          currentUser: widget.currentUser,
+          channelName: name,
+        ),
+      ),
+    );
+    _loadChannels();
   }
 
   Future<void> _openJoinCode() async {

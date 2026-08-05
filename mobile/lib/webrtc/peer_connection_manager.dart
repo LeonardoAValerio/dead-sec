@@ -8,19 +8,26 @@ import 'turn_credentials_service.dart';
 
 enum ConnectionIndicator { p2pDirect, turnRelay, offline }
 
-/// Gerencia o ciclo de vida de uma conexão WebRTC P2P.
+/// Gerencia o ciclo de vida de uma conexão WebRTC P2P com um peer remoto específico.
 ///
 /// - DataChannel em modo reliable+ordered para mensagens e chunks.
 /// - Indicador visual derivado do tipo de candidato ICE selecionado (SPEC-UI-001).
 /// - Credenciais TURN buscadas do backend antes de cada conexão (SPEC-TURN-002).
+/// - Filtra mensagens de sinalização pelo [remotePubKey] para suportar topologia mesh.
 class PeerConnectionManager {
   final SignalingClient signalingClient;
   final TurnCredentialsService turnService;
   final String roomId;
   final String localPubKey;
+  final String remotePubKey;
 
   RTCPeerConnection? _pc;
   RTCDataChannel? _dataChannel;
+
+  bool _startedAsOfferer = false;
+
+  /// True se este PCM foi iniciado como offerer (enviou offer ao peer remoto).
+  bool get isOfferer => _startedAsOfferer;
 
   // ICE candidates que chegam antes de setRemoteDescription são bufferizados e
   // aplicados assim que a remote description estiver pronta.
@@ -38,12 +45,6 @@ class PeerConnectionManager {
   /// Chamado quando o RTCDataChannel está aberto e pronto para enviar/receber.
   void Function(RTCDataChannel)? onDataChannelReady;
 
-  /// Chamado quando um novo peer entra na room (server → peer_joined).
-  void Function()? onPeerJoined;
-
-  /// Chamado quando um peer sai da room (server → peer_left).
-  void Function()? onPeerLeft;
-
   // Guard: evita double-subscribe em _listenSignaling() quando startAs* é chamado
   // múltiplas vezes (ex: após resetWebRTC + reconnect).
   StreamSubscription<SignalingMessage>? _signalingSubscription;
@@ -53,12 +54,14 @@ class PeerConnectionManager {
     required this.turnService,
     required this.roomId,
     required this.localPubKey,
+    required this.remotePubKey,
   });
 
   // ─── Iniciar chamada (peer que cria a oferta) ──────────────────────────
 
   Future<void> startAsOfferer() async {
-    debugPrint('[PCM] startAsOfferer — creating peer connection');
+    _startedAsOfferer = true;
+    debugPrint('[PCM:${_short(remotePubKey)}] startAsOfferer');
     await _createPeerConnection();
     _dataChannel = await _pc!.createDataChannel(
       'safechannel',
@@ -71,17 +74,18 @@ class PeerConnectionManager {
 
     final offer = await _pc!.createOffer();
     await _pc!.setLocalDescription(offer);
-    debugPrint('[PCM] offer created and sent');
-    signalingClient.send('offer', roomId, localPubKey, offer.toMap());
+    debugPrint('[PCM:${_short(remotePubKey)}] offer sent → to=${_short(remotePubKey)}');
+    signalingClient.send('offer', roomId, localPubKey, offer.toMap(), to: remotePubKey);
   }
 
   // ─── Responder chamada ─────────────────────────────────────────────────
 
   Future<void> startAsAnswerer() async {
-    debugPrint('[PCM] startAsAnswerer — waiting for offer');
+    _startedAsOfferer = false;
+    debugPrint('[PCM:${_short(remotePubKey)}] startAsAnswerer — expecting offer from ${_short(remotePubKey)}');
     await _createPeerConnection();
     _pc!.onDataChannel = (channel) {
-      debugPrint('[PCM] onDataChannel received');
+      debugPrint('[PCM:${_short(remotePubKey)}] onDataChannel received');
       _dataChannel = channel;
       _setupDataChannel(channel);
     };
@@ -114,11 +118,17 @@ class PeerConnectionManager {
     _pc = await createPeerConnection(config);
 
     _pc!.onIceCandidate = (candidate) {
-      signalingClient.send('ice-candidate', roomId, localPubKey, candidate.toMap());
+      signalingClient.send(
+        'ice-candidate',
+        roomId,
+        localPubKey,
+        candidate.toMap(),
+        to: remotePubKey,
+      );
     };
 
     _pc!.onConnectionState = (state) {
-      debugPrint('[PCM] connectionState → $state');
+      debugPrint('[PCM:${_short(remotePubKey)}] connectionState → $state');
       if (state == RTCPeerConnectionState.RTCPeerConnectionStateDisconnected ||
           state == RTCPeerConnectionState.RTCPeerConnectionStateFailed) {
         _indicatorController.add(ConnectionIndicator.offline);
@@ -126,12 +136,12 @@ class PeerConnectionManager {
     };
 
     _pc!.onSignalingState = (state) {
-      debugPrint('[PCM] signalingState → $state');
+      debugPrint('[PCM:${_short(remotePubKey)}] signalingState → $state');
     };
 
     // Detecta tipo de candidato via getStats() quando ICE conecta (SPEC-UI-001).
     _pc!.onIceConnectionState = (state) async {
-      debugPrint('[PCM] iceConnectionState → $state');
+      debugPrint('[PCM:${_short(remotePubKey)}] iceConnectionState → $state');
       if (state == RTCIceConnectionState.RTCIceConnectionStateConnected ||
           state == RTCIceConnectionState.RTCIceConnectionStateCompleted) {
         await _updateIndicatorFromStats();
@@ -142,14 +152,14 @@ class PeerConnectionManager {
     };
 
     _pc!.onIceGatheringState = (state) {
-      debugPrint('[PCM] iceGatheringState → $state');
+      debugPrint('[PCM:${_short(remotePubKey)}] iceGatheringState → $state');
     };
   }
 
   void _setupDataChannel(RTCDataChannel channel) {
     channel.onMessage = (msg) => _messageController.add(msg);
     channel.onDataChannelState = (state) {
-      debugPrint('[PCM] dataChannelState → $state');
+      debugPrint('[PCM:${_short(remotePubKey)}] dataChannelState → $state');
       if (state == RTCDataChannelState.RTCDataChannelOpen) {
         onDataChannelReady?.call(channel);
       } else if (state == RTCDataChannelState.RTCDataChannelClosed) {
@@ -159,13 +169,15 @@ class PeerConnectionManager {
   }
 
   void _listenSignaling() {
-    // Guard: uma única subscription por instância, independente de quantas vezes
-    // startAsOfferer/startAsAnswerer forem chamados.
+    // Guard: uma única subscription por instância.
     if (_signalingSubscription != null) return;
     _signalingSubscription = signalingClient.messages.listen((msg) async {
+      // Filtra: só processa offer/answer/ice-candidate do nosso peer remoto específico.
+      // peer_joined, peer_left e room_peers são tratados pelo ChatScreen via sua própria sub.
       switch (msg.type) {
         case SignalingMessageType.offer:
-          debugPrint('[PCM] received offer — setting remote description');
+          if (msg.from != remotePubKey) return;
+          debugPrint('[PCM:${_short(remotePubKey)}] received offer');
           try {
             await _pc!.setRemoteDescription(
               RTCSessionDescription(msg.data['sdp'] as String, msg.data['type'] as String),
@@ -174,26 +186,28 @@ class PeerConnectionManager {
             await _flushPendingCandidates();
             final answer = await _pc!.createAnswer();
             await _pc!.setLocalDescription(answer);
-            debugPrint('[PCM] answer created and sent');
-            signalingClient.send('answer', roomId, localPubKey, answer.toMap());
+            debugPrint('[PCM:${_short(remotePubKey)}] answer sent');
+            signalingClient.send('answer', roomId, localPubKey, answer.toMap(), to: remotePubKey);
           } catch (e) {
-            debugPrint('[PCM] error handling offer: $e');
+            debugPrint('[PCM:${_short(remotePubKey)}] error handling offer: $e');
           }
 
         case SignalingMessageType.answer:
-          debugPrint('[PCM] received answer — setting remote description');
+          if (msg.from != remotePubKey) return;
+          debugPrint('[PCM:${_short(remotePubKey)}] received answer');
           try {
             await _pc!.setRemoteDescription(
               RTCSessionDescription(msg.data['sdp'] as String, msg.data['type'] as String),
             );
             _remoteDescriptionSet = true;
             await _flushPendingCandidates();
-            debugPrint('[PCM] remote description set ✓');
+            debugPrint('[PCM:${_short(remotePubKey)}] remote description set ✓');
           } catch (e) {
-            debugPrint('[PCM] error handling answer: $e');
+            debugPrint('[PCM:${_short(remotePubKey)}] error handling answer: $e');
           }
 
         case SignalingMessageType.iceCandidate:
+          if (msg.from != remotePubKey) return;
           final candidate = RTCIceCandidate(
             msg.data['candidate'] as String?,
             msg.data['sdpMid'] as String?,
@@ -203,20 +217,12 @@ class PeerConnectionManager {
             try {
               await _pc!.addCandidate(candidate);
             } catch (e) {
-              debugPrint('[PCM] addCandidate error (ignored): $e');
+              debugPrint('[PCM:${_short(remotePubKey)}] addCandidate error (ignored): $e');
             }
           } else {
-            debugPrint('[PCM] ICE candidate buffered (remote desc not ready yet), total=${_pendingCandidates.length + 1}');
+            debugPrint('[PCM:${_short(remotePubKey)}] ICE candidate buffered, total=${_pendingCandidates.length + 1}');
             _pendingCandidates.add(candidate);
           }
-
-        case SignalingMessageType.peerJoined:
-          debugPrint('[PCM] peer_joined from=${msg.from}');
-          onPeerJoined?.call();
-
-        case SignalingMessageType.peerLeft:
-          debugPrint('[PCM] peer_left from=${msg.from}');
-          onPeerLeft?.call();
 
         default:
           break;
@@ -226,12 +232,12 @@ class PeerConnectionManager {
 
   Future<void> _flushPendingCandidates() async {
     if (_pendingCandidates.isEmpty) return;
-    debugPrint('[PCM] flushing ${_pendingCandidates.length} buffered ICE candidates');
+    debugPrint('[PCM:${_short(remotePubKey)}] flushing ${_pendingCandidates.length} buffered ICE candidates');
     for (final candidate in _pendingCandidates) {
       try {
         await _pc!.addCandidate(candidate);
       } catch (e) {
-        debugPrint('[PCM] buffered candidate failed (ignored): $e');
+        debugPrint('[PCM:${_short(remotePubKey)}] buffered candidate failed (ignored): $e');
       }
     }
     _pendingCandidates.clear();
@@ -265,16 +271,12 @@ class PeerConnectionManager {
       } else {
         _indicatorController.add(ConnectionIndicator.p2pDirect);
       }
-    } catch (_) {
-      // getStats pode falhar se a conexão já fechou
-    }
+    } catch (_) {}
   }
 
   /// Fecha a conexão WebRTC (PC + DataChannel) sem tocar no WebSocket de sinalização.
-  /// Usado quando um peer sai/volta para resetar o estado P2P mantendo o canal de
-  /// sinalização ativo. Após isso, chamar startAsOfferer() ou startAsAnswerer().
   Future<void> resetWebRTC() async {
-    debugPrint('[PCM] resetWebRTC — closing PC and DataChannel');
+    debugPrint('[PCM:${_short(remotePubKey)}] resetWebRTC');
     await _dataChannel?.close();
     await _pc?.close();
     _dataChannel = null;
@@ -292,4 +294,6 @@ class PeerConnectionManager {
     await _messageController.close();
     await _indicatorController.close();
   }
+
+  static String _short(String key) => key.length > 8 ? '${key.substring(0, 8)}…' : key;
 }

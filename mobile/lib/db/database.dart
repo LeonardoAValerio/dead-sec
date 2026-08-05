@@ -31,8 +31,9 @@ Future<Database> _openMobileDatabase(String encryptionKey) async {
   return cipher.openDatabase(
     dbPath,
     password: encryptionKey,
-    version: 1,
+    version: 2,
     onCreate: _createSchema,
+    onUpgrade: _upgradeSchema,
     onConfigure: (db) async {
       // PRAGMA journal_mode retorna resultado — rawQuery no lugar de execute
       // (execSQL do Android rejeita statements que retornam linhas)
@@ -50,8 +51,9 @@ Future<Database> _openDesktopDatabase() async {
   return ffi.databaseFactory.openDatabase(
     dbPath,
     options: OpenDatabaseOptions(
-      version: 1,
+      version: 2,
       onCreate: _createSchema,
+      onUpgrade: _upgradeSchema,
       onConfigure: (db) async {
         await db.execute('PRAGMA journal_mode=WAL');
         await db.execute('PRAGMA foreign_keys=ON');
@@ -78,8 +80,15 @@ Future<Database> openTestDatabase() async {
   ffi.databaseFactory = ffi.databaseFactoryFfi;
   return ffi.databaseFactory.openDatabase(
     inMemoryDatabasePath,
-    options: OpenDatabaseOptions(version: 1, onCreate: _createSchema),
+    options: OpenDatabaseOptions(version: 2, onCreate: _createSchema),
   );
+}
+
+/// Reencripta o banco com uma nova chave (apenas mobile — desktop não usa SQLCipher).
+/// Deve ser chamado com o banco já aberto e a nova passphrase derivada via Argon2id.
+Future<void> rekeyDatabase(Database db, String newPassphrase) async {
+  if (_isDesktopOrWeb) return;
+  await db.execute("PRAGMA rekey = '$newPassphrase'");
 }
 
 /// Deleta o banco de dados local no desktop (Linux/macOS/Windows).
@@ -89,6 +98,14 @@ Future<void> resetDesktopDatabase() async {
   final dbPath = _desktopDbPath();
   final file = File(dbPath);
   if (await file.exists()) await file.delete();
+}
+
+Future<void> _upgradeSchema(Database db, int oldVersion, int newVersion) async {
+  if (oldVersion < 2) {
+    await db.execute(
+      "ALTER TABLE channel_members ADD COLUMN display_name TEXT NOT NULL DEFAULT ''",
+    );
+  }
 }
 
 Future<void> _createSchema(Database db, int version) async {
@@ -122,6 +139,7 @@ Future<void> _createSchema(Database db, int version) async {
     CREATE TABLE channel_members (
       channel_id TEXT NOT NULL,
       user_id TEXT NOT NULL,
+      display_name TEXT NOT NULL DEFAULT '',
       public_key BLOB NOT NULL,
       role TEXT NOT NULL DEFAULT 'member',
       joined_at INTEGER NOT NULL,

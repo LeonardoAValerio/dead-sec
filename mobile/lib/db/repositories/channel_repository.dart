@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:sqflite_common/sqlite_api.dart';
 
@@ -48,5 +49,26 @@ class ChannelRepository {
       where: 'channel_id = ? AND user_id = ?',
       whereArgs: [channelId, userId],
     );
+  }
+
+  /// Remove registros de channel_members com a mesma [publicKey] mas [userId] diferente.
+  /// Usado para limpar o placeholder 'peer-<channelId>' criado no join via QR antes de
+  /// persistir o registro com o userId real recebido via MEMBER_INFO.
+  Future<void> deleteMemberByPublicKey(
+    String channelId,
+    Uint8List publicKey, {
+    String? exceptUserId,
+  }) async {
+    final where = exceptUserId != null
+        ? 'channel_id = ? AND public_key = ? AND user_id != ?'
+        : 'channel_id = ? AND public_key = ?';
+    final args = exceptUserId != null
+        ? [channelId, publicKey, exceptUserId]
+        : [channelId, publicKey];
+    await _db.delete('channel_members', where: where, whereArgs: args);
+  }
+
+  Future<void> deleteChannel(String id) async {
+    await _db.delete('channels', where: 'id = ?', whereArgs: [id]);
   }
 }

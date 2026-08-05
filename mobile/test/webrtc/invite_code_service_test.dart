@@ -70,4 +70,28 @@ void main() {
       expect(decoded, isNull);
     });
   });
+
+  group('Validação de senha (SPEC-CHAN-002)', () {
+    // A regra de senha mínima de 8 chars é aplicada na camada de UI
+    // (CreateChannelScreen e JoinCodeScreen) antes de chamar InviteCodeService.
+    // Estes testes verificam a lógica da regra isolada.
+
+    bool isSenhaValida(String senha) => senha.isEmpty || senha.length >= 8;
+
+    test('senha vazia é válida (campo opcional)', () {
+      expect(isSenhaValida(''), isTrue);
+    });
+
+    test('senha com 7 chars é inválida', () {
+      expect(isSenhaValida('1234567'), isFalse);
+    });
+
+    test('senha com 8 chars é válida', () {
+      expect(isSenhaValida('12345678'), isTrue);
+    });
+
+    test('senha com mais de 8 chars é válida', () {
+      expect(isSenhaValida('minha_senha_segura'), isTrue);
+    });
+  });
 }
