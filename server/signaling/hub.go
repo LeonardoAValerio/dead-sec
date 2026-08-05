@@ -147,6 +147,43 @@ func (h *Hub) Broadcast(roomID, fromPubKey string, msg []byte) int {
 	return 0
 }
 
+// SendTo envia uma mensagem diretamente para um peer específico da room.
+// Retorna true se a mensagem foi entregue com sucesso.
+func (h *Hub) SendTo(roomID, toPubKey string, msg []byte) bool {
+	h.mu.RLock()
+	r, ok := h.rooms[roomID]
+	h.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	r.mu.RLock()
+	p, found := r.peers[toPubKey]
+	r.mu.RUnlock()
+	if !found {
+		return false
+	}
+	return p.conn.Write(context.Background(), websocket.MessageText, msg) == nil
+}
+
+// GetPeers retorna os pubKeys de todos os peers da room exceto excludePubKey.
+func (h *Hub) GetPeers(roomID, excludePubKey string) []string {
+	h.mu.RLock()
+	r, ok := h.rooms[roomID]
+	h.mu.RUnlock()
+	if !ok {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	peers := make([]string, 0, len(r.peers))
+	for pk := range r.peers {
+		if pk != excludePubKey {
+			peers = append(peers, pk)
+		}
+	}
+	return peers
+}
+
 // roomSize retorna o número de peers atualmente na room.
 func (h *Hub) roomSize(roomID string) int {
 	h.mu.RLock()

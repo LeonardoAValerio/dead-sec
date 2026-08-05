@@ -16,12 +16,13 @@ O diferencial do produto é combinar a robustez de segurança de um protocolo P2
 /
 ├── mobile/          # App Flutter (cliente)
 │   ├── lib/
-│   │   ├── crypto/  # Signal Protocol, Argon2id, Ed25519
-│   │   ├── webrtc/  # flutter_webrtc, ICE, DataChannel
-│   │   ├── db/      # SQLCipher (sqflite_sqlcipher)
-│   │   ├── sync/    # Vector clocks, delta sync
-│   │   ├── ui/      # Telas e componentes
-│   │   └── models/  # Entidades locais
+│   │   ├── crypto/   # Signal Protocol, Argon2id, Ed25519
+│   │   ├── webrtc/   # flutter_webrtc, ICE, DataChannel
+│   │   ├── db/       # SQLCipher (sqflite_sqlcipher)
+│   │   ├── sync/     # Vector clocks, delta sync
+│   │   ├── services/ # NotificationService, BiometricService
+│   │   ├── ui/       # Telas e componentes
+│   │   └── models/   # Entidades locais
 ├── server/          # Backend Go
 │   ├── signaling/   # WebSocket WSS, zero-storage
 │   ├── turn/        # Pion TURN v2
@@ -284,6 +285,8 @@ Headers RTP não são criptografados pelo SRTP — expõem metadados de atividad
 | QR Code | `qr_flutter` + `mobile_scanner` |
 | Key Derivation | `argon2` (pointycastle) |
 | Biometria | `local_auth` |
+| Notificações Locais | `flutter_local_notifications` |
+| Preferências | `shared_preferences` |
 | Permissões | `permission_handler` |
 | Servidor Sinalização | Go + `nhooyr.io/websocket` |
 | TURN Server | Pion TURN v2 (`github.com/pion/turn/v2`) |
